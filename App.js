@@ -5,10 +5,9 @@
 //   - HOME: Custom character banner + scattered anime artwork & emojis.
 //   - PROGRESS: Flaming motivation cards, high-def character banners, scattered emojis.
 //   - HEALTH: Character-themed period tracker header + scattered mood emojis.
-//   - HEAD BATH: Shower/Winnie banner + scattered refreshing emojis.
 //   - EXPENSES: Wallet & piggy bank visuals, anime-styled finance cards + scattered emojis.
-//   - REPORTS: Wealth overview visuals + scattered financial emojis.
-//   - MENU: Home -> Expenses -> Reports -> Progress -> Notes -> Period Tracker -> Head Bath.
+//   - REPORTS: Wealth overview visuals + ritual consistency monthly calendars.
+//   - MENU: Home -> Expenses -> Reports -> Progress -> Notes -> Period Tracker.
 //   - NOTES: Collapsible "Buy" checklist section with anime note cards + scattered emojis.
 //   - Ready for Snack Expo Dev (snack.expo.dev) & Expo SDK 51+.
 // ─────────────────────────────────────────────────────────────
@@ -34,13 +33,23 @@ import {
 } from "react-native";
 import * as SQLite from "expo-sqlite";
 import Svg, { Circle } from "react-native-svg";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
 
 // ───────────── LOCAL ASSETS MAP ─────────────
 const LOCAL_ASSETS = {
+  a: require("./assets/a.png"),
+  b: require("./assets/b.png"),
+  c: require("./assets/c.png"),
+  d: require("./assets/d.png"),
+  e: require("./assets/e.png"),
+  f: require("./assets/f.png"),
   food: require("./assets/food.png"),
   hi: require("./assets/hi.png"),
+  dolphin: require("./assets/dolphin.png"),
   inosuke: require("./assets/inosuke.png"),
+  sanemi: require("./assets/sanemi.png"),
   jiraiya: require("./assets/jiraiya.png"),
+  shikamaru: require("./assets/shikamaru.jpg"),
   luffy: require("./assets/luffy.png"),
   luffyAngry: require("./assets/luffy_angry.png"),
   minato: require("./assets/minato.png"),
@@ -49,9 +58,31 @@ const LOCAL_ASSETS = {
   uzui: require("./assets/uzui.png"),
   nezuko: require("./assets/nezuko.png"),
   shinobu: require("./assets/shinobu.png"),
+  note1: require("./assets/note1.jpg"),
+  note2: require("./assets/note2.jpg"),
+  note3: require("./assets/note3.jpg"),
+  note4: require("./assets/note4.jpg"),
+  note5: require("./assets/note5.jpg"),
   winnie: require("./assets/winnie.jpeg"),
   logo: require("./assets/winnie.jpeg"),
 };
+
+const NOTE_IMAGES = [
+  LOCAL_ASSETS.note1,
+  LOCAL_ASSETS.note2,
+  LOCAL_ASSETS.note3,
+  LOCAL_ASSETS.note4,
+  LOCAL_ASSETS.note5,
+];
+
+const EXPENSE_IMAGES = [
+  LOCAL_ASSETS.d,
+  LOCAL_ASSETS.a,
+  LOCAL_ASSETS.b,
+  LOCAL_ASSETS.c,
+  LOCAL_ASSETS.dolphin,
+  LOCAL_ASSETS.f,
+];
 
 // ───────────── ASSET / ICON MAP ─────────────
 const APP_ICONS = {
@@ -61,7 +92,6 @@ const APP_ICONS = {
   progress: { uri: "https://img.icons8.com/color/48/fire-element.png" },
   notes: { uri: "https://img.icons8.com/color/48/notepad.png" },
   health: { uri: "https://img.icons8.com/color/48/like--v1.png" },
-  headbath: { uri: "https://img.icons8.com/color/48/shower.png" },
   empty: { uri: "https://img.icons8.com/color/48/box--v1.png" },
   buy: { uri: "https://img.icons8.com/color/48/shopping-cart--v1.png" },
 };
@@ -86,14 +116,13 @@ const colors = {
   negative: "#EF4444",
   expense: "#E5983B",
   progress: "#FF6B35",
-  headbath: "#38BDF8",
   periods: "#F472B6",
   periodsDark: "#831843",
   notes: "#818CF8",
   reminders: "#C084FC",
 };
 
-const TOP_INSET = Platform.OS === "android" ? (StatusBar.currentHeight || 26) : 48;
+const TOP_INSET = Platform.OS === "android" ? StatusBar.currentHeight || 26 : 48;
 const BOTTOM_INSET = 28;
 
 const cardShadow = {
@@ -149,16 +178,17 @@ function getMonthGrid(year, month) {
   for (let d = 1; d <= daysInMonth; d++) cells.push(d);
   return cells;
 }
-function getCurrentWeekDays() {
-  const today = new Date();
-  const dayOfWeek = today.getDay();
-  const sun = new Date(today);
-  sun.setDate(today.getDate() - dayOfWeek);
+function getWeekDaysForDate(centerDateStr) {
+  const [y, m, d] = centerDateStr.split("-").map(Number);
+  const baseDate = new Date(y, m - 1, d);
+  const dayOfWeek = baseDate.getDay();
+  const sun = new Date(baseDate);
+  sun.setDate(baseDate.getDate() - dayOfWeek);
   const week = [];
   for (let i = 0; i < 7; i++) {
-    const d = new Date(sun);
-    d.setDate(sun.getDate() + i);
-    week.push(toISODate(d));
+    const temp = new Date(sun);
+    temp.setDate(sun.getDate() + i);
+    week.push(toISODate(temp));
   }
   return week;
 }
@@ -230,10 +260,6 @@ async function initDatabase() {
     );
 
     CREATE TABLE IF NOT EXISTS period_days (
-      date TEXT PRIMARY KEY
-    );
-
-    CREATE TABLE IF NOT EXISTS headbath_days (
       date TEXT PRIMARY KEY
     );
 
@@ -390,6 +416,7 @@ async function toggleRitualLog(date, ritualId) {
 }
 async function getRitualLogsForDates(dates) {
   const db = await getDb();
+  if (dates.length === 0) return {};
   const placeholders = dates.map(() => "?").join(",");
   const rows = await db.getAllAsync(
     `SELECT date, ritual_id FROM ritual_logs WHERE date IN (${placeholders}) AND completed = 1`,
@@ -404,6 +431,16 @@ async function getRitualLogsForDates(dates) {
     map[r.date].add(r.ritual_id);
   });
   return map;
+}
+
+async function getRitualLogsForMonth(ritualId, year, month) {
+  const db = await getDb();
+  const prefix = `${year}-${String(month + 1).padStart(2, "0")}`;
+  const rows = await db.getAllAsync(
+    `SELECT date FROM ritual_logs WHERE ritual_id = ? AND completed = 1 AND date LIKE ?`,
+    [ritualId, `${prefix}-%`]
+  );
+  return new Set(rows.map((r) => r.date));
 }
 
 // ───────────── STREAK QUERIES ─────────────
@@ -622,21 +659,6 @@ async function togglePeriodDay(date) {
   }
 }
 
-// ───────────── HEAD BATH QUERIES ─────────────
-async function getAllHeadbathDays() {
-  const db = await getDb();
-  return db.getAllAsync(`SELECT date FROM headbath_days ORDER BY date ASC`);
-}
-async function toggleHeadbathDay(date) {
-  const db = await getDb();
-  const existing = await db.getFirstAsync(`SELECT date FROM headbath_days WHERE date=?`, [date]);
-  if (existing) {
-    await db.runAsync(`DELETE FROM headbath_days WHERE date=?`, [date]);
-  } else {
-    await db.runAsync(`INSERT INTO headbath_days (date) VALUES (?)`, [date]);
-  }
-}
-
 // ───────────── BUY ITEMS QUERIES ─────────────
 async function listBuyItems() {
   const db = await getDb();
@@ -702,11 +724,16 @@ async function deleteNote(id) {
 function ScreenHeader({ title, onMenuPress, iconKey }) {
   return (
     <View style={s.headerContainer}>
-      <Pressable onPress={onMenuPress} style={s.menuBtnInline} hitSlop={10}>
+      <TouchableOpacity
+        onPress={onMenuPress}
+        style={s.menuBtnInline}
+        hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}
+        activeOpacity={0.6}
+      >
         <View style={s.menuLine} />
         <View style={s.menuLine} />
         <View style={s.menuLine} />
-      </Pressable>
+      </TouchableOpacity>
       {iconKey && APP_ICONS[iconKey] && (
         <Image source={APP_ICONS[iconKey]} style={s.headerIcon} />
       )}
@@ -719,61 +746,77 @@ function ScreenHeader({ title, onMenuPress, iconKey }) {
 function Drawer({ visible, onClose, activeTab, onSelectTab, tabs }) {
   const translateX = useRef(new Animated.Value(-320)).current;
   const backdropOpacity = useRef(new Animated.Value(0)).current;
-  const [mounted, setMounted] = useState(visible);
+  const [modalVisible, setModalVisible] = useState(false);
 
   useEffect(() => {
     if (visible) {
-      setMounted(true);
-      Animated.parallel([
-        Animated.timing(translateX, { toValue: 0, duration: 260, useNativeDriver: true }),
-        Animated.timing(backdropOpacity, { toValue: 1, duration: 260, useNativeDriver: true }),
-      ]).start();
+      translateX.setValue(-320);
+      backdropOpacity.setValue(0);
+      setModalVisible(true);
     } else {
       Animated.parallel([
         Animated.timing(translateX, { toValue: -320, duration: 200, useNativeDriver: true }),
         Animated.timing(backdropOpacity, { toValue: 0, duration: 200, useNativeDriver: true }),
-      ]).start(() => setMounted(false));
+      ]).start(() => setModalVisible(false));
     }
   }, [visible]);
 
-  if (!mounted) return null;
+  function handleShow() {
+    Animated.parallel([
+      Animated.timing(translateX, { toValue: 0, duration: 260, useNativeDriver: true }),
+      Animated.timing(backdropOpacity, { toValue: 1, duration: 260, useNativeDriver: true }),
+    ]).start();
+  }
 
   return (
-    <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
-      <Animated.View style={[StyleSheet.absoluteFill, { opacity: backdropOpacity }]}>
-        <Pressable style={[StyleSheet.absoluteFill, s.backdrop]} onPress={onClose} />
-      </Animated.View>
+    <Modal
+      visible={modalVisible}
+      transparent
+      animationType="none"
+      onShow={handleShow}
+      onRequestClose={onClose}
+      statusBarTranslucent
+    >
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <Animated.View
+          style={[StyleSheet.absoluteFill, { backgroundColor: "rgba(0,0,0,0.6)", opacity: backdropOpacity }]}
+          pointerEvents="box-none"
+        >
+          <TouchableOpacity
+            style={StyleSheet.absoluteFill}
+            onPress={onClose}
+            activeOpacity={1}
+          />
+        </Animated.View>
 
-      <Animated.View style={[s.drawer, { transform: [{ translateX }] }]}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
-          <Image source={LOCAL_ASSETS.winnie} style={s.drawerAvatar} />
-          <Text style={s.drawerBrand}>Winnie 🐾</Text>
-        </View>
+        <Animated.View style={[s.drawer, { transform: [{ translateX }] }]}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+            <Image source={LOCAL_ASSETS.winnie} style={s.drawerAvatar} />
+            <Text style={s.drawerBrand}>Winnie 🐾</Text>
+          </View>
 
-        <View style={{ marginTop: 32, gap: 6 }}>
-          {tabs.map((t) => {
-            const active = activeTab === t.key;
-            return (
-              <Pressable
-                key={t.key}
-                onPress={() => {
-                  onSelectTab(t.key);
-                  onClose();
-                }}
-                style={[s.drawerItem, active && { backgroundColor: colors.surface }]}
-              >
-                {APP_ICONS[t.key] ? (
-                  <Image source={APP_ICONS[t.key]} style={s.drawerIcon} />
-                ) : (
+          <View style={{ marginTop: 32, gap: 6 }}>
+            {tabs.map((t) => {
+              const active = activeTab === t.key;
+              return (
+                <TouchableOpacity
+                  key={t.key}
+                  onPress={() => {
+                    onSelectTab(t.key);
+                    onClose();
+                  }}
+                  style={[s.drawerItem, active && { backgroundColor: colors.surface }]}
+                  activeOpacity={0.7}
+                >
                   <View style={[s.dot, { backgroundColor: active ? t.accent : "transparent", borderColor: t.accent }]} />
-                )}
-                <Text style={[s.drawerItemText, active && { color: colors.text, fontWeight: "600" }]}>{t.label}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
-      </Animated.View>
-    </View>
+                  <Text style={[s.drawerItemText, active && { color: colors.text, fontWeight: "600" }]}>{t.label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </Animated.View>
+      </GestureHandlerRootView>
+    </Modal>
   );
 }
 
@@ -989,33 +1032,48 @@ function HabitProgressRing({ completed = 0, total = 3, size = 38, strokeWidth = 
 // ───────────── WEEK STREAK BAR (HOME) ─────────────
 const DAY_ABBR = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 
-function WeekStreakBar({ weekDays, logsMap, totalRituals, todayStr }) {
-  const todayCompleted = logsMap[todayStr]?.size || 0;
-  const allDoneToday = totalRituals > 0 && todayCompleted >= totalRituals;
+function WeekStreakBar({ selectedDate, setSelectedDate, weekDays, logsMap, totalRituals, todayStr }) {
+  const selectedCompleted = logsMap[selectedDate]?.size || 0;
+  const allDoneSelected = totalRituals > 0 && selectedCompleted >= totalRituals;
+  const label = relativeDayLabel(selectedDate);
 
   return (
     <View style={[s.weekStreakCard, cardShadow]}>
       <View style={s.weekStreakHeader}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <Pressable onPress={() => setSelectedDate((prev) => addDays(prev, -7))} hitSlop={12}>
+            <Text style={s.arrow}>‹</Text>
+          </Pressable>
           <Image source={APP_ICONS.progress} style={{ width: 22, height: 22 }} />
           <View>
             <Text style={s.weekStreakTitle}>Weekly Consistency 📈</Text>
             <Text style={s.weekStreakSub}>
-              {allDoneToday
-                ? "All rituals completed today! 🌟 🎉"
-                : `${todayCompleted} of ${totalRituals} completed today ⏱️`}
+              {allDoneSelected
+                ? `All rituals completed ${label.toLowerCase()}! 🌟 🎉`
+                : `${selectedCompleted} of ${totalRituals} completed ${label.toLowerCase()} ⏱️`}
             </Text>
           </View>
         </View>
-        <View style={s.weekStreakBadge}>
-          <Text style={s.weekStreakBadgeText}>
-            {todayCompleted}/{totalRituals}
-          </Text>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <View style={s.weekStreakBadge}>
+            <Text style={s.weekStreakBadgeText}>
+              {selectedCompleted}/{totalRituals}
+            </Text>
+          </View>
+          <Pressable
+            onPress={() => setSelectedDate((prev) => addDays(prev, 7))}
+            hitSlop={12}
+            disabled={selectedDate >= todayStr}
+            style={{ opacity: selectedDate >= todayStr ? 0.3 : 1 }}
+          >
+            <Text style={s.arrow}>›</Text>
+          </Pressable>
         </View>
       </View>
 
       <View style={s.weekStreakRow}>
         {weekDays.map((d, index) => {
+          const isSelected = d === selectedDate;
           const isToday = d === todayStr;
           const completedCount = logsMap[d]?.size || 0;
           const dayNum = parseInt(d.split("-")[2], 10);
@@ -1023,8 +1081,12 @@ function WeekStreakBar({ weekDays, logsMap, totalRituals, todayStr }) {
           const isAllDone = totalRituals > 0 && completedCount >= totalRituals;
 
           return (
-            <View key={d} style={[s.weekStreakDayCol, isToday && s.weekStreakTodayCol]}>
-              <Text style={[s.weekStreakDayLabel, isToday && { color: colors.streakOrange, fontWeight: "700" }]}>
+            <Pressable
+              key={d}
+              onPress={() => setSelectedDate(d)}
+              style={[s.weekStreakDayCol, isSelected && s.weekStreakTodayCol]}
+            >
+              <Text style={[s.weekStreakDayLabel, isSelected && { color: colors.streakOrange, fontWeight: "700" }]}>
                 {dayLabel}
               </Text>
               <HabitProgressRing
@@ -1038,7 +1100,7 @@ function WeekStreakBar({ weekDays, logsMap, totalRituals, todayStr }) {
               <View style={s.weekStreakDotSlot}>
                 {isAllDone && <Text style={{ fontSize: 9 }}>🔥</Text>}
               </View>
-            </View>
+            </Pressable>
           );
         })}
       </View>
@@ -1199,9 +1261,10 @@ function getGreeting() {
   return "Good evening 🌙";
 }
 
-function HomeScreen({ onMenuPress }) {
+function HomeScreen({ onMenuPress, onRitualTapped }) {
   const todayStr = todayISO();
-  const weekDays = getCurrentWeekDays();
+  const [selectedDate, setSelectedDate] = useState(todayISO());
+  const weekDays = getWeekDaysForDate(selectedDate);
   const [rituals, setRituals] = useState([]);
   const [logsMap, setLogsMap] = useState({});
   const [recentExpenses, setRecentExpenses] = useState([]);
@@ -1212,19 +1275,22 @@ function HomeScreen({ onMenuPress }) {
     const [allRituals, weekLogs, recent] = await Promise.all([
       listRituals(),
       getRitualLogsForDates(weekDays),
-      getEntriesForDate(todayStr),
+      getEntriesForDate(selectedDate),
     ]);
     setRituals(allRituals);
     setLogsMap(weekLogs);
     setRecentExpenses(recent);
-  }, [todayStr]);
+  }, [selectedDate, weekDays]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  async function handleToggle(ritualId) {
-    await toggleRitualLog(todayStr, ritualId);
+  async function handleToggle(ritual) {
+    await toggleRitualLog(selectedDate, ritual.id);
+    if (onRitualTapped) {
+      onRitualTapped(ritual);
+    }
     loadData();
   }
 
@@ -1238,12 +1304,8 @@ function HomeScreen({ onMenuPress }) {
     setModalVisible(true);
   }
 
-  const todayCompletedSet = logsMap[todayStr] || new Set();
-  const formattedToday = new Date().toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-  });
+  const selectedCompletedSet = logsMap[selectedDate] || new Set();
+  const formattedSelected = relativeDayLabel(selectedDate);
 
   return (
     <View style={s.screen}>
@@ -1260,11 +1322,13 @@ function HomeScreen({ onMenuPress }) {
 
         {/* Date Subtitle */}
         <View style={s.homeGreetingRow}>
-          <Text style={s.todayDate}>📅 {formattedToday}</Text>
+          <Text style={s.todayDate}>📅 Showing: {formattedSelected} ({selectedDate})</Text>
         </View>
 
         {/* 1. WEEK STREAK BAR */}
         <WeekStreakBar
+          selectedDate={selectedDate}
+          setSelectedDate={setSelectedDate}
           weekDays={weekDays}
           logsMap={logsMap}
           totalRituals={rituals.length}
@@ -1275,7 +1339,7 @@ function HomeScreen({ onMenuPress }) {
         <View style={[s.habitsSectionCard, cardShadow]}>
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <View>
-              <Text style={s.sectionHeaderTitle}>Today's Daily Rituals 🎯</Text>
+              <Text style={s.sectionHeaderTitle}>Daily Rituals ({formattedSelected}) 🎯</Text>
               <Text style={s.sectionHeaderSub}>Tap to complete · Long-press to edit or delete 💡</Text>
             </View>
             <Pressable onPress={handleAddRitual} style={s.addRitualTopBtn}>
@@ -1288,8 +1352,8 @@ function HomeScreen({ onMenuPress }) {
               <DynamicRitualCircle
                 key={r.id}
                 ritual={r}
-                completed={todayCompletedSet.has(r.id)}
-                onPress={() => handleToggle(r.id)}
+                completed={selectedCompletedSet.has(r.id)}
+                onPress={() => handleToggle(r)}
                 onLongPress={() => handleEditRitual(r)}
               />
             ))}
@@ -1303,11 +1367,11 @@ function HomeScreen({ onMenuPress }) {
         </View>
 
         {/* 3. TODAY'S RECENT ENTRIES */}
-        <Text style={s.listLabel}>Today's Logged Activity 📊</Text>
+        <Text style={s.listLabel}>Logged Activity ({formattedSelected}) 📊</Text>
         {recentExpenses.length === 0 ? (
           <View style={s.emptyStateContainer}>
             <Image source={APP_ICONS.empty} style={s.emptyIcon} />
-            <Text style={s.emptyText}>No activity logged for today yet. ✨</Text>
+            <Text style={s.emptyText}>No activity logged for {formattedSelected.toLowerCase()} yet. ✨</Text>
           </View>
         ) : (
           recentExpenses.map((entry) => (
@@ -1398,312 +1462,206 @@ function ProgressScreen({ onMenuPress }) {
   return (
     <View style={s.screen}>
       <ScreenHeader title="Progress" onMenuPress={onMenuPress} iconKey="progress" />
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 }}>
-        {/* MOTIVATION ART BANNER */}
-        <View style={s.bannerCard}>
-          <Image source={LOCAL_ASSETS.inosuke} style={s.bannerImage} />
-          <View style={s.bannerOverlay}>
-            <Text style={s.bannerTitle}>Never Give Up! 🔥</Text>
-            <Text style={s.bannerSub}>Push past your limits and build unwavering consistency ⭐</Text>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 10 : 0}
+      >
+        <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 }}>
+          {/* MOTIVATION ART BANNER */}
+          <View style={s.bannerCard}>
+            <Image source={LOCAL_ASSETS.inosuke} style={s.bannerImage} />
+            <View style={s.bannerOverlay}>
+              <Text style={s.bannerTitle}>Never Give Up! 🔥</Text>
+              <Text style={s.bannerSub}>Push past your limits and build unwavering consistency ⭐</Text>
+            </View>
           </View>
-        </View>
 
-        {/* HERO STREAK CELEBRATION */}
-        <View style={[s.heroStreakCard, cardShadow, { marginTop: 16 }]}>
-          <View style={s.flameGlowWrap}>
-            <View style={s.flameGlowEffect} />
-            <Text style={s.heroFlameIcon}>🔥</Text>
-          </View>
-          <Text style={s.heroStreakNumber}>{currentStreak}</Text>
-          <Text style={s.heroStreakTitle}>Day Streak! ⚡</Text>
-          <Text style={s.heroStreakSubtitle}>
-            {isTodayActive
-              ? "You kept the streak alive today! Outstanding work 🎉."
-              : currentStreak > 0
-              ? "Complete today's study session to keep your streak! 🎯"
-              : "Start your streak today by logging your study ritual 🚀."}
-          </Text>
+          {/* HERO STREAK CELEBRATION */}
+          <View style={[s.heroStreakCard, cardShadow, { marginTop: 16 }]}>
+            <View style={s.flameGlowWrap}>
+              <View style={s.flameGlowEffect} />
+              <Text style={s.heroFlameIcon}>🔥</Text>
+            </View>
+            <Text style={s.heroStreakNumber}>{currentStreak}</Text>
+            <Text style={s.heroStreakTitle}>Day Streak! ⚡</Text>
+            <Text style={s.heroStreakSubtitle}>
+              {isTodayActive
+                ? "You kept the streak alive today! Outstanding work 🎉."
+                : currentStreak > 0
+                ? "Complete today's study session to keep your streak! 🎯"
+                : "Start your streak today by logging your study ritual 🚀."}
+            </Text>
 
-          {/* DUAL METRICS */}
-          <View style={s.dualStreakContainer}>
-            <View style={s.streakMetricCard}>
-              <View style={s.streakMetricHeader}>
-                <Text style={{ fontSize: 18 }}>🔥</Text>
-                <Text style={s.streakMetricLabel}>CURRENT</Text>
+            {/* DUAL METRICS */}
+            <View style={s.dualStreakContainer}>
+              <View style={s.streakMetricCard}>
+                <View style={s.streakMetricHeader}>
+                  <Text style={{ fontSize: 18 }}>🔥</Text>
+                  <Text style={s.streakMetricLabel}>CURRENT</Text>
+                </View>
+                <View style={s.streakMetricValueRow}>
+                  <Text style={s.streakMetricValue}>{currentStreak}</Text>
+                  <Text style={s.streakMetricUnit}>days</Text>
+                </View>
+                <Text style={s.streakMetricSub}>Active streak ⏱️</Text>
               </View>
-              <View style={s.streakMetricValueRow}>
-                <Text style={s.streakMetricValue}>{currentStreak}</Text>
-                <Text style={s.streakMetricUnit}>days</Text>
+
+              <View style={s.streakMetricDivider} />
+
+              <View style={s.streakMetricCard}>
+                <View style={s.streakMetricHeader}>
+                  <Text style={{ fontSize: 18 }}>🏆</Text>
+                  <Text style={s.streakMetricLabel}>HIGHEST</Text>
+                </View>
+                <View style={s.streakMetricValueRow}>
+                  <Text style={[s.streakMetricValue, { color: colors.streakGold }]}>{highestStreak}</Text>
+                  <Text style={s.streakMetricUnit}>days</Text>
+                </View>
+                <Text style={s.streakMetricSub}>All-time record 🌟</Text>
               </View>
-              <Text style={s.streakMetricSub}>Active streak ⏱️</Text>
-            </View>
-
-            <View style={s.streakMetricDivider} />
-
-            <View style={s.streakMetricCard}>
-              <View style={s.streakMetricHeader}>
-                <Text style={{ fontSize: 18 }}>🏆</Text>
-                <Text style={s.streakMetricLabel}>HIGHEST</Text>
-              </View>
-              <View style={s.streakMetricValueRow}>
-                <Text style={[s.streakMetricValue, { color: colors.streakGold }]}>{highestStreak}</Text>
-                <Text style={s.streakMetricUnit}>days</Text>
-              </View>
-              <Text style={s.streakMetricSub}>All-time record 🌟</Text>
             </View>
           </View>
-        </View>
 
-        {/* CALENDAR */}
-        <View style={[s.summaryCard, cardShadow, { marginTop: 18 }]}>
-          <View style={s.monthNav}>
-            <Pressable onPress={() => setMonthDate(new Date(year, month - 1, 1))} hitSlop={12}>
-              <Text style={s.arrow}>‹</Text>
-            </Pressable>
-            <View style={{ alignItems: "center" }}>
-              <Text style={s.monthLabel}>{monthLabel}</Text>
-              <Text style={s.dateSub}>Streak History 📅</Text>
-            </View>
-            <Pressable onPress={() => setMonthDate(new Date(year, month + 1, 1))} hitSlop={12}>
-              <Text style={s.arrow}>›</Text>
-            </Pressable>
-          </View>
-
-          <View style={s.weekRow}>
-            {["S", "M", "T", "W", "T", "F", "S"].map((d, i) => (
-              <Text key={i} style={s.weekLabel}>
-                {d}
-              </Text>
-            ))}
-          </View>
-
-          <View style={s.calendarGrid}>
-            {cells.map((day, i) => {
-              const dateStr = day ? toISODate(new Date(year, month, day)) : null;
-              const hasStreak = dateStr && activeSet.has(dateStr);
-              const isToday = dateStr === todayISO();
-
-              return (
-                <Pressable
-                  key={i}
-                  disabled={!day}
-                  onPress={() => handleToggleDay(day)}
-                  style={s.dayCell}
-                >
-                  {day ? (
-                    <View
-                      style={[
-                        s.dayCircleRound,
-                        hasStreak && s.streakDayCellActive,
-                        isToday && s.squareMarker,
-                        isToday && !hasStreak && s.todayCalendarBorder,
-                      ]}
-                    >
-                      {hasStreak ? (
-                        <>
-                          <Text style={s.streakDayFireIcon}>🔥</Text>
-                          <Text style={s.streakDayNumText}>{day}</Text>
-                        </>
-                      ) : (
-                        <Text style={[s.dayText, isToday && { color: colors.text, fontWeight: "700" }]}>
-                          {day}
-                        </Text>
-                      )}
-                    </View>
-                  ) : null}
-                </Pressable>
-              );
-            })}
-          </View>
-
-          <View style={s.cardDivider} />
-          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-              <Text style={{ fontSize: 16 }}>🔥</Text>
-              <Text style={{ color: colors.textMuted, fontSize: 12 }}>Streak day</Text>
-            </View>
-            <Text style={{ color: colors.textFaint, fontSize: 11 }}>Tap date to toggle study streak ⚡</Text>
-          </View>
-        </View>
-
-        {/* LEARNING NOTES SECTION UNDER THE CALENDAR */}
-        <Text style={[s.listLabel, { marginTop: 22 }]}>Daily Learning Notes 💡</Text>
-
-        {/* SAVED NOTES */}
-        {learningNotes.map((note) => (
-          <View key={note.id} style={s.learningEntry}>
-            <Pressable
-              onPress={() => {
-                setEditingLearningId(note.id);
-                setLearningNote(note.body);
-                setLearningOpen(true);
-              }}
-              style={{ flex: 1 }}
-            >
-              <Text style={s.learningEntryText}>{note.body}</Text>
-              <Text style={s.learningEntryHint}>Tap to edit ✏️</Text>
-            </Pressable>
-            <Pressable
-              onPress={async () => {
-                await deleteLearningEntry(note.id);
-                if (editingLearningId === note.id) {
-                  setEditingLearningId(null);
-                  setLearningNote("");
-                }
-                loadData();
-              }}
-              hitSlop={10}
-            >
-              <Text style={s.entryDeleteX}>×</Text>
-            </Pressable>
-          </View>
-        ))}
-
-        {/* INPUT FORM FOR TODAY'S LEARNING */}
-        <View style={[s.learningCard, cardShadow, { marginBottom: 14 }]}>
-          <Pressable onPress={() => setLearningOpen((o) => !o)} style={s.learningHeader}>
-            <View style={{ flex: 1 }}>
-              <Text style={s.learningTitle}>
-                {editingLearningId ? "Edit Learning Note ✏️" : "Capture Today's Learnings 🧠"}
-              </Text>
-              {!learningOpen && <Text style={s.learningCollapsedText}>+ Write or edit a key insight 📝</Text>}
-            </View>
-            <Text style={[s.learningToggle, { color: colors.streakOrange }]}>{learningOpen ? "−" : "+"}</Text>
-          </Pressable>
-          {learningOpen && (
-            <>
-              <TextInput
-                value={learningNote}
-                onChangeText={setLearningNote}
-                placeholder="What did you learn or accomplish today?"
-                placeholderTextColor={colors.textFaint}
-                multiline
-                style={s.learningInput}
-              />
-              <Pressable
-                onPress={saveLearningNote}
-                style={[s.learningSave, { backgroundColor: colors.streakOrange }]}
-              >
-                <Text style={s.saveBtnText}>
-                  {savedNote ? "Saved ✓ 🎉" : editingLearningId ? "Update Note 🔄" : "Save Learning Note 💾"}
-                </Text>
+          {/* CALENDAR */}
+          <View style={[s.summaryCard, cardShadow, { marginTop: 18 }]}>
+            <View style={s.monthNav}>
+              <Pressable onPress={() => setMonthDate(new Date(year, month - 1, 1))} hitSlop={12}>
+                <Text style={s.arrow}>‹</Text>
               </Pressable>
-            </>
-          )}
-        </View>
-      </ScrollView>
-    </View>
-  );
-}
-
-// ───────────── HEAD BATH SCREEN ─────────────
-function HeadbathScreen({ onMenuPress }) {
-  const [monthDate, setMonthDate] = useState(() => {
-    const t = new Date();
-    return new Date(t.getFullYear(), t.getMonth(), 1);
-  });
-  const [markedDays, setMarkedDays] = useState(new Set());
-
-  const loadData = useCallback(async () => {
-    const rows = await getAllHeadbathDays();
-    const dates = rows.map((r) => r.date);
-    setMarkedDays(new Set(dates));
-  }, []);
-
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
-
-  const year = monthDate.getFullYear();
-  const month = monthDate.getMonth();
-  const cells = getMonthGrid(year, month);
-  const monthLabel = monthDate.toLocaleDateString("en-US", { month: "long", year: "numeric" });
-
-  async function handleDayPress(day) {
-    if (!day) return;
-    const dateStr = toISODate(new Date(year, month, day));
-    await toggleHeadbathDay(dateStr);
-    loadData();
-  }
-
-  return (
-    <View style={s.screen}>
-      <ScreenHeader title="Head Bath" onMenuPress={onMenuPress} iconKey="headbath" />
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 }}>
-        {/* BANNER ART FOR HEADBATH */}
-        <View style={s.bannerCard}>
-          <Image source={LOCAL_ASSETS.jiraiya} style={s.bannerImage} />
-          <View style={s.bannerOverlay}>
-            <Text style={s.bannerTitle}>Stay Fresh & Clean 🧼</Text>
-            <Text style={s.bannerSub}>Track your hair washing schedule effortlessly 💦</Text>
-          </View>
-        </View>
-
-        <View style={[s.summaryCard, cardShadow, { marginTop: 18 }]}>
-          <View style={s.monthNav}>
-            <Pressable onPress={() => setMonthDate(new Date(year, month - 1, 1))} hitSlop={12}>
-              <Text style={s.arrow}>‹</Text>
-            </Pressable>
-            <View style={{ alignItems: "center" }}>
-              <Text style={s.monthLabel}>{monthLabel}</Text>
-              <Text style={s.dateSub}>Head Bath Calendar 🚿</Text>
+              <View style={{ alignItems: "center" }}>
+                <Text style={s.monthLabel}>{monthLabel}</Text>
+                <Text style={s.dateSub}>Streak History 📅</Text>
+              </View>
+              <Pressable onPress={() => setMonthDate(new Date(year, month + 1, 1))} hitSlop={12}>
+                <Text style={s.arrow}>›</Text>
+              </Pressable>
             </View>
-            <Pressable onPress={() => setMonthDate(new Date(year, month + 1, 1))} hitSlop={12}>
-              <Text style={s.arrow}>›</Text>
-            </Pressable>
-          </View>
 
-          <View style={s.weekRow}>
-            {["S", "M", "T", "W", "T", "F", "S"].map((d, i) => (
-              <Text key={i} style={s.weekLabel}>
-                {d}
-              </Text>
-            ))}
-          </View>
+            <View style={s.weekRow}>
+              {["S", "M", "T", "W", "T", "F", "S"].map((d, i) => (
+                <Text key={i} style={s.weekLabel}>
+                  {d}
+                </Text>
+              ))}
+            </View>
 
-          <View style={s.calendarGrid}>
-            {cells.map((day, i) => {
-              const dateStr = day ? toISODate(new Date(year, month, day)) : null;
-              const marked = dateStr && markedDays.has(dateStr);
-              const isToday = dateStr === todayISO();
+            <View style={s.calendarGrid}>
+              {cells.map((day, i) => {
+                const dateStr = day ? toISODate(new Date(year, month, day)) : null;
+                const hasStreak = dateStr && activeSet.has(dateStr);
+                const isToday = dateStr === todayISO();
 
-              return (
-                <Pressable
-                  key={i}
-                  disabled={!day}
-                  onPress={() => handleDayPress(day)}
-                  style={s.dayCell}
-                >
-                  {day ? (
-                    <View
-                      style={[
-                        s.dayCircleRound,
-                        marked && s.headbathCircleMarked,
-                        isToday && s.squareMarker,
-                        isToday && !marked && s.todayCalendarBorder,
-                      ]}
-                    >
-                      <Text
+                return (
+                  <Pressable
+                    key={i}
+                    disabled={!day}
+                    onPress={() => handleToggleDay(day)}
+                    style={s.dayCell}
+                  >
+                    {day ? (
+                      <View
                         style={[
-                          s.dayText,
-                          marked && { color: "#FFFFFF", fontWeight: "700" },
+                          s.dayCircleRound,
+                          hasStreak && s.streakDayCellActive,
+                          isToday && s.squareMarker,
+                          isToday && !hasStreak && s.todayCalendarBorder,
                         ]}
                       >
-                        {day}
-                      </Text>
-                    </View>
-                  ) : null}
-                </Pressable>
-              );
-            })}
+                        {hasStreak ? (
+                          <>
+                            <Text style={s.streakDayFireIcon}>🔥</Text>
+                            <Text style={s.streakDayNumText}>{day}</Text>
+                          </>
+                        ) : (
+                          <Text style={[s.dayText, isToday && { color: colors.text, fontWeight: "700" }]}>
+                            {day}
+                          </Text>
+                        )}
+                      </View>
+                    ) : null}
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            <View style={s.cardDivider} />
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <Text style={{ fontSize: 16 }}>🔥</Text>
+                <Text style={{ color: colors.textMuted, fontSize: 12 }}>Streak day</Text>
+              </View>
+              <Text style={{ color: colors.textFaint, fontSize: 11 }}>Tap date to toggle study streak ⚡</Text>
+            </View>
           </View>
 
-          <View style={s.cardDivider} />
-          <Text style={s.hint}>
-            Tap a date to mark or unmark a head bath day 🚿.
-          </Text>
-        </View>
-      </ScrollView>
+          {/* LEARNING NOTES SECTION UNDER THE CALENDAR */}
+          <Text style={[s.listLabel, { marginTop: 22 }]}>Daily Learning Notes 💡</Text>
+
+          {/* SAVED NOTES */}
+          {learningNotes.map((note) => (
+            <View key={note.id} style={s.learningEntry}>
+              <Pressable
+                onPress={() => {
+                  setEditingLearningId(note.id);
+                  setLearningNote(note.body);
+                  setLearningOpen(true);
+                }}
+                style={{ flex: 1 }}
+              >
+                <Text style={s.learningEntryText}>{note.body}</Text>
+                <Text style={s.learningEntryHint}>Tap to edit ✏️</Text>
+              </Pressable>
+              <Pressable
+                onPress={async () => {
+                  await deleteLearningEntry(note.id);
+                  if (editingLearningId === note.id) {
+                    setEditingLearningId(null);
+                    setLearningNote("");
+                  }
+                  loadData();
+                }}
+                hitSlop={10}
+              >
+                <Text style={s.entryDeleteX}>×</Text>
+              </Pressable>
+            </View>
+          ))}
+
+          {/* INPUT FORM FOR TODAY'S LEARNING */}
+          <View style={[s.learningCard, cardShadow, { marginBottom: 14 }]}>
+            <Pressable onPress={() => setLearningOpen((o) => !o)} style={s.learningHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={s.learningTitle}>
+                  {editingLearningId ? "Edit Learning Note ✏️" : "Capture Today's Learnings 🧠"}
+                </Text>
+                {!learningOpen && <Text style={s.learningCollapsedText}>+ Write or edit a key insight 📝</Text>}
+              </View>
+              <Text style={[s.learningToggle, { color: colors.streakOrange }]}>{learningOpen ? "−" : "+"}</Text>
+            </Pressable>
+            {learningOpen && (
+              <>
+                <TextInput
+                  value={learningNote}
+                  onChangeText={setLearningNote}
+                  placeholder="What did you learn or accomplish today?"
+                  placeholderTextColor={colors.textFaint}
+                  multiline
+                  style={s.learningInput}
+                />
+                <Pressable
+                  onPress={saveLearningNote}
+                  style={[s.learningSave, { backgroundColor: colors.streakOrange }]}
+                >
+                  <Text style={s.saveBtnText}>
+                    {savedNote ? "Saved ✓ 🎉" : editingLearningId ? "Update Note 🔄" : "Save Learning Note 💾"}
+                  </Text>
+                </Pressable>
+              </>
+            )}
+          </View>
+        </ScrollView>
+      </KeyboardAvoidingView>
     </View>
   );
 }
@@ -1802,8 +1760,6 @@ function HealthScreen({ onMenuPress }) {
                       style={[
                         s.dayCircleRound,
                         marked && s.periodCircleMarked,
-                        isToday && s.squareMarker,
-                        isToday && !marked && s.todayCalendarBorder,
                       ]}
                     >
                       <Text
@@ -1911,73 +1867,85 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
       <Pressable style={s.modalBackdrop} onPress={onClose} />
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={s.sheetWrap}>
-        <View style={s.sheet}>
-          <View style={s.grabber} />
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        style={s.sheetWrap}
+      >
+        <ScrollView
+          contentContainerStyle={{ flexGrow: 1, justifyContent: "flex-end" }}
+          keyboardShouldPersistTaps="handled"
+        >
+          <View style={s.sheetCompact}>
+            <View style={s.grabber} />
 
-          <View style={s.segment}>
-            <Pressable
-              onPress={() => setEntryType("income")}
-              style={[s.segmentBtn, entryType === "income" && { backgroundColor: colors.positive }]}
-            >
-              <Text style={[s.segmentText, entryType === "income" && s.segmentTextActive]}>Income 💰</Text>
-            </Pressable>
-            <Pressable
-              onPress={() => setEntryType("expense")}
-              style={[s.segmentBtn, entryType === "expense" && { backgroundColor: colors.expense }]}
-            >
-              <Text style={[s.segmentText, entryType === "expense" && s.segmentTextActive]}>Expense 💳</Text>
-            </Pressable>
-          </View>
-
-          <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-            <Text style={s.label}>Category / Title 🏷️</Text>
-            <View style={s.quickEntryRow}>
-              <TagDropdown
-                kind={entryType}
-                value={category}
-                onChange={(tag) => {
-                  setCategory(tag);
-                  setTitle(tag.name);
-                }}
-                accentColor={accent}
-                placeholder="Search or add category"
-                containerStyle={s.quickTitleInput}
-              />
-              <TextInput
-                value={amount}
-                onChangeText={setAmount}
-                placeholder="Amount (₹)"
-                placeholderTextColor={colors.textFaint}
-                keyboardType="numeric"
-                editable={breakdown.length === 0}
-                style={[s.input, s.quickAmountInput, breakdown.length > 0 && { opacity: 0.6 }]}
-              />
+            {/* Income / Expense Segment Selector */}
+            <View style={s.segment}>
+              <Pressable
+                onPress={() => setEntryType("income")}
+                style={[s.segmentBtn, entryType === "income" && { backgroundColor: colors.positive }]}
+              >
+                <Text style={[s.segmentText, entryType === "income" && s.segmentTextActive]}>Income 💰</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setEntryType("expense")}
+                style={[s.segmentBtn, entryType === "expense" && { backgroundColor: colors.expense }]}
+              >
+                <Text style={[s.segmentText, entryType === "expense" && s.segmentTextActive]}>Expense 💳</Text>
+              </Pressable>
             </View>
 
-            {breakdown.length > 0 && <Text style={s.hint}>Auto-filled from breakdown below 🧮</Text>}
-
-            <Pressable onPress={() => setShowBreakdown((v) => !v)} style={{ marginTop: 14, marginBottom: 6 }}>
-              <Text style={{ color: accent, fontWeight: "600" }}>
-                {showBreakdown ? "− Hide breakdown 📜" : "+ Add a breakdown 📋"}
-              </Text>
-            </Pressable>
-
-            {showBreakdown && (
-              <View style={s.breakdownBox}>
-                <BreakdownTable items={breakdown} onChange={handleBreakdownChange} accentColor={accent} />
+            <View style={{ flexShrink: 1 }}>
+              {/* ADD EXPENSE FORM SECTION */}
+              <Text style={s.label}>Category / Title 🏷️</Text>
+              <View style={s.quickEntryRow}>
+                <TagDropdown
+                  kind={entryType}
+                  value={category}
+                  onChange={(tag) => {
+                    setCategory(tag);
+                    setTitle(tag.name);
+                  }}
+                  accentColor={accent}
+                  placeholder="Search or add category"
+                  containerStyle={s.quickTitleInput}
+                />
+                <TextInput
+                  value={amount}
+                  onChangeText={setAmount}
+                  placeholder="Amount (₹)"
+                  placeholderTextColor={colors.textFaint}
+                  keyboardType="numeric"
+                  editable={breakdown.length === 0}
+                  style={[s.input, s.quickAmountInput, breakdown.length > 0 && { opacity: 0.6 }]}
+                />
               </View>
-            )}
 
+              {breakdown.length > 0 && <Text style={s.hint}>Auto-filled from breakdown below 🧮</Text>}
+
+              {/* BREAKDOWN SECTION */}
+              <Pressable onPress={() => setShowBreakdown((v) => !v)} style={{ marginTop: 10, marginBottom: 4 }}>
+                <Text style={{ color: accent, fontWeight: "600" }}>
+                  {showBreakdown ? "− Hide breakdown 📜" : "+ Add a breakdown 📋"}
+                </Text>
+              </Pressable>
+
+              {showBreakdown && (
+                <View style={s.breakdownBox}>
+                  <BreakdownTable items={breakdown} onChange={handleBreakdownChange} accentColor={accent} />
+                </View>
+              )}
+            </View>
+
+            {/* SAVE BUTTON AT THE BOTTOM VISIBLE IN A SINGLE GO */}
             <Pressable
               onPress={handleSave}
               disabled={saving}
-              style={[s.saveBtn, { backgroundColor: accent, opacity: saving ? 0.6 : 1 }]}
+              style={[s.saveBtn, { backgroundColor: accent, opacity: saving ? 0.6 : 1, marginTop: 12 }]}
             >
               <Text style={s.saveBtnText}>{isEditing ? "Update Entry 🔄" : "Save Entry 💾"}</Text>
             </Pressable>
-          </ScrollView>
-        </View>
+          </View>
+        </ScrollView>
       </KeyboardAvoidingView>
     </Modal>
   );
@@ -2031,6 +1999,7 @@ function EntryCard({ entry, onDeleted, onEdit, interactive = true, showDate = fa
   const [breakdown, setBreakdown] = useState(null);
   const isIncome = entry.type === "income";
   const hasBreakdown = entry.breakdown_count > 0;
+  const expenseImage = EXPENSE_IMAGES[(entry.id || 0) % EXPENSE_IMAGES.length];
 
   async function toggleExpand() {
     if (!hasBreakdown) return;
@@ -2072,10 +2041,7 @@ function EntryCard({ entry, onDeleted, onEdit, interactive = true, showDate = fa
   const cardContent = (
     <View style={s.entryCard}>
       <Pressable onPress={toggleExpand} onLongPress={handleLongPress} style={s.entryRow}>
-        <Image 
-          source={entry.title.toLowerCase().includes("food") ? LOCAL_ASSETS.food : LOCAL_ASSETS.nezuko} 
-          style={s.entryCardThumb} 
-        />
+        <Image source={expenseImage} style={s.entryCardThumb} />
         <View style={s.entryLeft}>
           <View style={[s.dotSolid, { backgroundColor: isIncome ? colors.positive : colors.expense }]} />
           <View style={{ flexShrink: 1 }}>
@@ -2272,21 +2238,117 @@ function DonutChart({ rows, colorsForRows }) {
   );
 }
 
+function RitualReportCalendar({ ritual, monthDate, onToggleDay }) {
+  const [minimized, setMinimized] = useState(true);
+  const [loggedDates, setLoggedDates] = useState(new Set());
+
+  const year = monthDate.getFullYear();
+  const month = monthDate.getMonth();
+
+  const loadData = useCallback(async () => {
+    const dates = await getRitualLogsForMonth(ritual.id, year, month);
+    setLoggedDates(dates);
+  }, [ritual.id, year, month]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  const cells = getMonthGrid(year, month);
+  const monthLabel = monthDate.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+  const completedDaysCount = loggedDates.size;
+
+  async function handleDayPress(day) {
+    if (!day) return;
+    const dateStr = toISODate(new Date(year, month, day));
+    await toggleRitualLog(dateStr, ritual.id);
+    if (onToggleDay) onToggleDay();
+    loadData();
+  }
+
+  return (
+    <View style={[s.reportCard, cardShadow, { marginBottom: 12 }]}>
+      <Pressable
+        onPress={() => setMinimized((prev) => !prev)}
+        style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}
+      >
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+          <Text style={{ fontSize: 22 }}>{ritual.emoji}</Text>
+          <View>
+            <Text style={s.entryTitle}>{ritual.name}</Text>
+            <Text style={s.dateSub}>
+              {completedDaysCount} days completed in {monthLabel}
+            </Text>
+          </View>
+        </View>
+        <Text style={[s.learningToggle, { color: colors.habitGreen }]}>{minimized ? "+" : "−"}</Text>
+      </Pressable>
+
+      {!minimized && (
+        <View style={{ marginTop: 14 }}>
+          <View style={s.weekRow}>
+            {["S", "M", "T", "W", "T", "F", "S"].map((d, i) => (
+              <Text key={i} style={s.weekLabel}>
+                {d}
+              </Text>
+            ))}
+          </View>
+
+          <View style={s.calendarGrid}>
+            {cells.map((day, i) => {
+              const dateStr = day ? toISODate(new Date(year, month, day)) : null;
+              const isLogged = dateStr && loggedDates.has(dateStr);
+              const isToday = dateStr === todayISO();
+
+              return (
+                <Pressable
+                  key={i}
+                  disabled={!day}
+                  onPress={() => handleDayPress(day)}
+                  style={s.dayCell}
+                >
+                  {day ? (
+                    <View
+                      style={[
+                        s.dayCircleRound,
+                        isLogged && s.streakDayCellActive,
+                        isToday && s.squareMarker,
+                        isToday && !isLogged && s.todayCalendarBorder,
+                      ]}
+                    >
+                      <Text style={[s.dayText, isLogged && { color: "#FFFFFF", fontWeight: "700" }]}>
+                        {day}
+                      </Text>
+                    </View>
+                  ) : null}
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+      )}
+    </View>
+  );
+}
+
 function ExpenseReportsScreen({ onMenuPress }) {
   const [month, setMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [rows, setRows] = useState([]);
+  const [rituals, setRituals] = useState([]);
   const [summary, setSummary] = useState({ income: 0, expense: 0 });
   const [loading, setLoading] = useState(true);
   const chartColors = [colors.expense, colors.habitGreen, colors.notes, colors.reminders, colors.periods, colors.streakOrange];
 
   const load = useCallback(async () => {
     setLoading(true);
-    const [monthSummary, reportRows] = await Promise.all([
+    const [monthSummary, reportRows, allRituals] = await Promise.all([
       getMonthlySummary(month.getFullYear(), month.getMonth()),
       getMonthlyExpenseReport(month.getFullYear(), month.getMonth()),
+      listRituals(),
     ]);
     setSummary(monthSummary);
     setRows(reportRows);
+    setRituals(allRituals);
     setLoading(false);
   }, [month]);
 
@@ -2356,6 +2418,8 @@ function ExpenseReportsScreen({ onMenuPress }) {
           </View>
         </View>
 
+        
+
         {loading ? (
           <Text style={s.emptyText}>Loading report… ⏳</Text>
         ) : rows.length === 0 ? (
@@ -2375,7 +2439,7 @@ function ExpenseReportsScreen({ onMenuPress }) {
                       <View style={[s.dotSolid, { backgroundColor: chartColors[index % chartColors.length] }]} />
                       <Text style={s.entryTitle}>{row.category}</Text>
                     </View>
-                    <Text style={s.entryAmount}>
+                    <Text style={s.reportCategoryText}>
                       ₹{row.total.toFixed(0)} · {pct}%
                     </Text>
                   </View>
@@ -2410,6 +2474,12 @@ function ExpenseReportsScreen({ onMenuPress }) {
             <View style={[s.reportCard, cardShadow]}>
               <DonutChart rows={rows} colorsForRows={chartColors} />
             </View>
+        {/* RITUAL CONSISTENCY REPORT SECTION */}
+        <Text style={s.listLabel}>Ritual Consistency Reports 🗓️</Text>
+        {rituals.map((r) => (
+          <RitualReportCalendar key={r.id} ritual={r} monthDate={month} onToggleDay={load} />
+        ))}
+
           </>
         )}
       </ScrollView>
@@ -2499,7 +2569,7 @@ function BuySection() {
                   item.completed && s.buyCheckboxCompleted,
                 ]}
               >
-                {item.completed && <Text style={s.buyCheckmark}>✓</Text>}
+                {item.completed ? <Text style={s.buyCheckmark}>✓</Text> : null}
               </Pressable>
             </View>
           ))}
@@ -2589,8 +2659,9 @@ function NotesScreen({ onMenuPress }) {
             <Text style={[s.listLabel, { marginTop: 18 }]}>Your Notes 📝</Text>
           </View>
         }
-        renderItem={({ item }) => {
+        renderItem={({ item, index }) => {
           const preview = (item.body || "").split("\n")[0].trim();
+          const noteImage = NOTE_IMAGES[index % NOTE_IMAGES.length];
           return (
             <Pressable
               onPress={() => {
@@ -2610,15 +2681,17 @@ function NotesScreen({ onMenuPress }) {
                   },
                 ]);
               }}
-              style={s.noteCard}
+              style={s.noteBannerCard}
             >
-              <Image source={LOCAL_ASSETS.jiraiya} style={s.noteCardBanner} />
-              <Text style={s.noteCardTitle} numberOfLines={1}>
-                {item.title || "Untitled note"}
-              </Text>
-              <Text style={s.notePreview} numberOfLines={1}>
-                {preview || "No additional text"}
-              </Text>
+              <Image source={noteImage} style={s.noteBannerImage} />
+              <View style={s.noteBannerContent}>
+                <Text style={s.noteBannerTitle} numberOfLines={1}>
+                  {item.title || "Untitled note"}
+                </Text>
+                <Text style={s.noteBannerPreview} numberOfLines={2}>
+                  {preview || "No additional text"}
+                </Text>
+              </View>
             </Pressable>
           );
         }}
@@ -2651,7 +2724,6 @@ const TABS = [
   { key: "progress", label: "Progress", accent: colors.streakOrange },
   { key: "notes", label: "Notes", accent: colors.notes },
   { key: "health", label: "Period Tracker", accent: colors.periods },
-  { key: "headbath", label: "Head Bath", accent: colors.headbath },
 ];
 
 export default function App() {
@@ -2665,33 +2737,36 @@ export default function App() {
 
   if (!ready) {
     return (
-      <View style={[s.screen, { alignItems: "center", justifyContent: "center" }]}>
-        <Text style={{ color: colors.textMuted }}>Loading Winnie… 🐾</Text>
-      </View>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <View style={[s.screen, { alignItems: "center", justifyContent: "center" }]}>
+          <Text style={{ color: colors.textMuted }}>Loading Winnie… 🐾</Text>
+        </View>
+      </GestureHandlerRootView>
     );
   }
 
   const openMenu = () => setDrawerOpen(true);
 
   return (
-    <View style={s.screen}>
-      <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
-      {tab === "home" && <HomeScreen onMenuPress={openMenu} />}
-      {tab === "expenses" && <ExpensesScreen focusKey={tab} onMenuPress={openMenu} />}
-      {tab === "reports" && <ExpenseReportsScreen onMenuPress={openMenu} />}
-      {tab === "progress" && <ProgressScreen onMenuPress={openMenu} />}
-      {tab === "notes" && <NotesScreen onMenuPress={openMenu} />}
-      {tab === "health" && <HealthScreen onMenuPress={openMenu} />}
-      {tab === "headbath" && <HeadbathScreen onMenuPress={openMenu} />}
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <View style={s.screen}>
+        <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
+        {tab === "home" && <HomeScreen onMenuPress={openMenu} />}
+        {tab === "expenses" && <ExpensesScreen focusKey={tab} onMenuPress={openMenu} />}
+        {tab === "reports" && <ExpenseReportsScreen onMenuPress={openMenu} />}
+        {tab === "progress" && <ProgressScreen onMenuPress={openMenu} />}
+        {tab === "notes" && <NotesScreen onMenuPress={openMenu} />}
+        {tab === "health" && <HealthScreen onMenuPress={openMenu} />}
 
-      <Drawer
-        visible={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-        activeTab={tab}
-        onSelectTab={setTab}
-        tabs={TABS}
-      />
-    </View>
+        <Drawer
+          visible={drawerOpen}
+          onClose={() => setDrawerOpen(false)}
+          activeTab={tab}
+          onSelectTab={setTab}
+          tabs={TABS}
+        />
+      </View>
+    </GestureHandlerRootView>
   );
 }
 
@@ -2718,12 +2793,9 @@ const s = StyleSheet.create({
     width: 36,
     height: 36,
     borderRadius: 18,
-    borderWidth: 1.5,
-    borderColor: colors.streakOrange,
   },
   bannerCard: {
     width: "100%",
-    backgroundColor: '#000000',
     flexDirection: "row",
     alignItems: "center",
     borderRadius: 18,
@@ -2738,7 +2810,7 @@ const s = StyleSheet.create({
     borderRadius: 12,
     resizeMode: "contain",
   },
-  bannerTextContainer: {
+  bannerOverlay: {
     flex: 1,
     marginLeft: 14,
     justifyContent: "center",
@@ -2782,6 +2854,12 @@ const s = StyleSheet.create({
     marginRight: 14,
     ...cardShadow,
   },
+  menuLine: {
+    width: 16,
+    height: 2,
+    backgroundColor: colors.text,
+    borderRadius: 1,
+  },
   headerTitleText: {
     color: colors.text,
     fontSize: 24,
@@ -2789,13 +2867,13 @@ const s = StyleSheet.create({
     letterSpacing: -0.4,
   },
   todayDate: { color: colors.textMuted, fontSize: 14, fontWeight: "500" },
-  homeGreetingRow: { marginBottom: 10 },
-  menuLine: { width: 18, height: 2, borderRadius: 1, backgroundColor: colors.textMuted },
-  backdrop: { backgroundColor: "rgba(0,0,0,0.65)" },
+  homeGreetingRow: { marginVertical: 4 },
+
+  backdrop: { backgroundColor: "rgba(0,0,0,0.6)" },
   drawer: {
     position: "absolute",
-    top: 0,
     left: 0,
+    top: 0,
     bottom: 0,
     width: 280,
     backgroundColor: colors.surfaceRaised,
@@ -2803,194 +2881,129 @@ const s = StyleSheet.create({
     paddingHorizontal: 20,
     borderRightWidth: 1,
     borderRightColor: colors.border,
-    ...cardShadow,
   },
   drawerBrand: { color: colors.text, fontSize: 20, fontWeight: "800" },
   drawerItem: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
     paddingVertical: 12,
     paddingHorizontal: 14,
     borderRadius: 12,
+    gap: 12,
   },
   drawerItemText: { color: colors.textMuted, fontSize: 15 },
+
   dot: { width: 8, height: 8, borderRadius: 4, borderWidth: 1.5 },
   dotSolid: { width: 8, height: 8, borderRadius: 4 },
-  
-  // Weekly Streak
+
   weekStreakCard: {
     backgroundColor: colors.surface,
     borderRadius: 18,
     padding: 16,
+    marginVertical: 10,
     borderWidth: 1,
     borderColor: colors.border,
-    marginBottom: 16,
   },
-  weekStreakHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 14 },
-  weekStreakTitle: { color: colors.text, fontSize: 16, fontWeight: "700" },
-  weekStreakSub: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
+  weekStreakHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 14,
+  },
+  weekStreakTitle: { color: colors.text, fontSize: 15, fontWeight: "700" },
+  weekStreakSub: { color: colors.textMuted, fontSize: 11, marginTop: 2 },
   weekStreakBadge: {
-    backgroundColor: colors.surfaceHighlight,
+    backgroundColor: colors.surfaceRaised,
     paddingHorizontal: 10,
     paddingVertical: 4,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: colors.borderLight,
+    borderColor: colors.border,
   },
   weekStreakBadgeText: { color: colors.habitGreen, fontSize: 12, fontWeight: "700" },
   weekStreakRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  weekStreakDayCol: { alignItems: "center", gap: 6, flex: 1 },
-  weekStreakTodayCol: { backgroundColor: "rgba(255, 107, 53, 0.08)", borderRadius: 12, paddingVertical: 4 },
-  weekStreakDayLabel: { color: colors.textMuted, fontSize: 11, fontWeight: "500" },
-  weekStreakDotSlot: { height: 12, justifyContent: "center", alignItems: "center" },
-  weekRingFilled: { alignItems: "center", justifyContent: "center", borderWidth: 1.5 },
-  weekRingCheck: { color: "#FFFFFF", fontSize: 14, fontWeight: "800" },
+  weekStreakDayCol: { alignItems: "center", flex: 1 },
+  weekStreakTodayCol: { backgroundColor: "rgba(255,107,53,0.08)", borderRadius: 10, paddingVertical: 4 },
+  weekStreakDayLabel: { color: colors.textFaint, fontSize: 11, marginBottom: 6, fontWeight: "600" },
+  weekStreakDotSlot: { height: 12, justifyContent: "center", alignItems: "center", marginTop: 4 },
+  weekRingFilled: { justifyContent: "center", alignItems: "center", borderWidth: 1 },
+  weekRingCheck: { color: "#FFFFFF", fontSize: 18, fontWeight: "800" },
   weekRingDayNum: { fontSize: 12 },
   todayActiveDot: {
-    position: "absolute",
-    bottom: -2,
     width: 4,
     height: 4,
     borderRadius: 2,
     backgroundColor: colors.streakOrange,
+    position: "absolute",
+    bottom: 2,
   },
 
-  // Daily Rituals
   habitsSectionCard: {
     backgroundColor: colors.surface,
     borderRadius: 18,
     padding: 16,
+    marginVertical: 10,
     borderWidth: 1,
     borderColor: colors.border,
-    marginBottom: 20,
   },
-  sectionHeaderTitle: { color: colors.text, fontSize: 16, fontWeight: "700" },
+  sectionHeaderTitle: { color: colors.text, fontSize: 16, fontWeight: "800" },
   sectionHeaderSub: { color: colors.textMuted, fontSize: 11, marginTop: 2 },
   addRitualTopBtn: {
     backgroundColor: colors.surfaceHighlight,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 10,
-    borderWidth: 1,
-    borderColor: colors.borderLight,
   },
-  addRitualTopBtnText: { color: colors.text, fontSize: 12, fontWeight: "600" },
+  addRitualTopBtnText: { color: colors.habitGreen, fontSize: 12, fontWeight: "700" },
   habitsRow: { flexDirection: "row", flexWrap: "wrap", gap: 14, marginTop: 14 },
-  habitCircleWrap: { alignItems: "center", gap: 6, width: 62 },
+  habitCircleWrap: { alignItems: "center", width: 64 },
   habitCircleBtn: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
+    width: 58,
+    height: 58,
+    borderRadius: 29,
     alignItems: "center",
     justifyContent: "center",
-    borderWidth: 2,
+    borderWidth: 1,
+  },
+  habitCircleBtnActive: {
+    backgroundColor: colors.surfaceHighlight,
+    borderColor: colors.habitGreen,
   },
   habitCircleBtnInactive: {
     backgroundColor: colors.surfaceRaised,
     borderColor: colors.border,
   },
-  habitCircleBtnActive: {
-    backgroundColor: colors.habitGreenGlow,
-    borderColor: colors.habitGreen,
-  },
   addCircleBtn: {
-    backgroundColor: colors.surfaceRaised,
-    borderColor: colors.border,
     borderStyle: "dashed",
+    borderColor: colors.textFaint,
+    backgroundColor: "transparent",
   },
-  habitEmoji: { fontSize: 24 },
+  habitEmoji: { fontSize: 26 },
   habitCheckmarkBadge: {
     position: "absolute",
     bottom: -2,
     right: -2,
+    backgroundColor: colors.habitGreen,
     width: 20,
     height: 20,
     borderRadius: 10,
-    backgroundColor: colors.habitGreen,
     alignItems: "center",
     justifyContent: "center",
   },
-  habitCheckmarkText: { color: "#FFFFFF", fontSize: 11, fontWeight: "800" },
-  habitLabel: { color: colors.textMuted, fontSize: 11, textAlign: "center" },
+  habitCheckmarkText: { color: "#FFF", fontSize: 11, fontWeight: "800" },
+  habitLabel: { color: colors.textMuted, fontSize: 11, marginTop: 6, textAlign: "center" },
 
-  // List & Section Headers
-  listLabel: { color: colors.textMuted, fontSize: 13, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 10 },
-  
-  // Expenses Entry Cards
-  swipeWrap: { marginBottom: 10 },
-  swipeBackdrop: {
-    position: "absolute",
-    top: 0,
-    bottom: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: colors.negative,
-    borderRadius: 14,
-    justifyContent: "center",
-    paddingLeft: 20,
-  },
-  swipeDeleteLabel: { color: "#FFFFFF", fontWeight: "700", fontSize: 14 },
-  entryCard: {
-    backgroundColor: colors.surface,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: colors.border,
-    overflow: "hidden",
-  },
-  entryRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    padding: 12,
-    justifyContent: "space-between",
-  },
-  entryCardThumb: { width: 36, height: 36, borderRadius: 18, marginRight: 10 },
-  entryLeft: { flexDirection: "row", alignItems: "center", gap: 10, flex: 1 },
-  entryTitle: { color: colors.text, fontSize: 15, fontWeight: "600" },
-  entryCategory: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
-  entryRight: { flexDirection: "row", alignItems: "center", gap: 12 },
-  entryAmount: { fontSize: 15, fontWeight: "700" },
-  entryDeleteX: { color: colors.textFaint, fontSize: 20, fontWeight: "300", paddingHorizontal: 4 },
-  entryBreakdownWrap: {
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    backgroundColor: colors.surfaceRaised,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-  },
-  entryBreakdownRow: { flexDirection: "row", justifyContent: "space-between", paddingVertical: 4 },
-  entryBreakdownLabel: { color: colors.textMuted, fontSize: 12 },
-  entryBreakdownAmount: { color: colors.text, fontSize: 12, fontWeight: "600" },
+  listLabel: { color: colors.textMuted, fontSize: 13, fontWeight: "600", marginTop: 18, marginBottom: 8 },
 
-  // Summary & Cards
-  summaryCard: {
-    backgroundColor: colors.surface,
-    borderRadius: 18,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: colors.border,
-    marginBottom: 16,
-  },
-  dateRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  dateDay: { color: colors.text, fontSize: 24, fontWeight: "800" },
-  dateSub: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
-  arrow: { color: colors.textMuted, fontSize: 28, fontWeight: "300", paddingHorizontal: 12 },
-  cardDivider: { height: 1, backgroundColor: colors.border, marginVertical: 14 },
-  balanceRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  balanceLabel: { color: colors.textMuted, fontSize: 11, fontWeight: "500" },
-  balanceValueSm: { color: colors.text, fontSize: 15, fontWeight: "700", marginTop: 2 },
-  balanceValueLg: { color: colors.habitGreen, fontSize: 20, fontWeight: "800", marginTop: 2 },
-
-  // Hero Streak (Progress)
   heroStreakCard: {
     backgroundColor: colors.surface,
-    borderRadius: 20,
-    padding: 20,
+    borderRadius: 18,
+    padding: 18,
+    alignItems: "center",
     borderWidth: 1,
     borderColor: colors.border,
-    alignItems: "center",
   },
-  flameGlowWrap: { width: 54, height: 54, alignItems: "center", justifyContent: "center" },
+  flameGlowWrap: { width: 50, height: 50, alignItems: "center", justifyContent: "center" },
   flameGlowEffect: {
     position: "absolute",
     width: 44,
@@ -2999,71 +3012,73 @@ const s = StyleSheet.create({
     backgroundColor: colors.streakOrangeGlow,
   },
   heroFlameIcon: { fontSize: 32 },
-  heroStreakNumber: { color: colors.text, fontSize: 44, fontWeight: "900", marginTop: 4 },
-  heroStreakTitle: { color: colors.streakOrange, fontSize: 16, fontWeight: "800" },
-  heroStreakSubtitle: { color: colors.textMuted, fontSize: 12, textAlign: "center", marginTop: 6, lineHeight: 18 },
+  heroStreakNumber: { color: colors.text, fontSize: 44, fontWeight: "900", marginTop: -4 },
+  heroStreakTitle: { color: colors.streakOrange, fontSize: 16, fontWeight: "800", marginTop: -2 },
+  heroStreakSubtitle: { color: colors.textMuted, fontSize: 12, textAlign: "center", marginTop: 6, paddingHorizontal: 10 },
   dualStreakContainer: {
     flexDirection: "row",
-    marginTop: 18,
-    paddingTop: 16,
+    alignItems: "center",
+    marginTop: 16,
+    paddingTop: 14,
     borderTopWidth: 1,
     borderTopColor: colors.border,
     width: "100%",
   },
   streakMetricCard: { flex: 1, alignItems: "center" },
   streakMetricHeader: { flexDirection: "row", alignItems: "center", gap: 4 },
-  streakMetricLabel: { color: colors.textMuted, fontSize: 10, fontWeight: "700", letterSpacing: 0.8 },
-  streakMetricValueRow: { flexDirection: "row", alignItems: "baseline", gap: 4, marginTop: 4 },
-  streakMetricValue: { color: colors.text, fontSize: 22, fontWeight: "800" },
-  streakMetricUnit: { color: colors.textMuted, fontSize: 12 },
-  streakMetricSub: { color: colors.textFaint, fontSize: 11, marginTop: 2 },
-  streakMetricDivider: { width: 1, backgroundColor: colors.border, marginHorizontal: 8 },
+  streakMetricLabel: { color: colors.textFaint, fontSize: 10, fontWeight: "800", letterSpacing: 0.5 },
+  streakMetricValueRow: { flexDirection: "row", alignItems: "baseline", gap: 2, marginTop: 2 },
+  streakMetricValue: { color: colors.streakOrange, fontSize: 22, fontWeight: "900" },
+  streakMetricUnit: { color: colors.textMuted, fontSize: 11 },
+  streakMetricSub: { color: colors.textFaint, fontSize: 10, marginTop: 2 },
+  streakMetricDivider: { width: 1, height: 36, backgroundColor: colors.border },
 
-  // Calendar
-  monthNav: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 12 },
-  monthLabel: { color: colors.text, fontSize: 16, fontWeight: "700" },
-  weekRow: { flexDirection: "row", justifyContent: "space-around", marginBottom: 8 },
-  weekLabel: { color: colors.textFaint, fontSize: 12, fontWeight: "600", width: 32, textAlign: "center" },
-  calendarGrid: { flexDirection: "row", flexWrap: "wrap" },
-  dayCell: { width: `${100 / 7}%`, height: 42, alignItems: "center", justifyContent: "center" },
-  dayCircleRound: { width: 32, height: 32, borderRadius: 16, alignItems: "center", justifyContent: "center" },
-  dayText: { color: colors.textMuted, fontSize: 13 },
-  todayCalendarBorder: { borderWidth: 1.5, borderColor: colors.streakOrange },
-  squareMarker: { borderRadius: 8 },
-  streakDayCellActive: { backgroundColor: colors.streakOrange },
-  streakDayFireIcon: { fontSize: 10, position: "absolute", top: 2 },
-  streakDayNumText: { color: "#FFFFFF", fontSize: 11, fontWeight: "800", marginTop: 8 },
-  headbathCircleMarked: { backgroundColor: colors.headbath },
-  periodCircleMarked: { backgroundColor: colors.periods },
-  hint: { color: colors.textMuted, fontSize: 12, textAlign: "center" },
-
-  // Daily Learning Notes
-  learningEntry: {
+  summaryCard: {
     backgroundColor: colors.surface,
-    borderRadius: 12,
-    padding: 14,
+    borderRadius: 18,
+    padding: 16,
     borderWidth: 1,
     borderColor: colors.border,
-    marginBottom: 10,
-    flexDirection: "row",
-    alignItems: "center",
   },
-  learningEntryText: { color: colors.text, fontSize: 14, lineHeight: 20 },
-  learningEntryHint: { color: colors.textFaint, fontSize: 11, marginTop: 4 },
+  monthNav: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  monthLabel: { color: colors.text, fontSize: 17, fontWeight: "800" },
+  dateSub: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
+  arrow: { color: colors.textMuted, fontSize: 24, paddingHorizontal: 8 },
+  weekRow: { flexDirection: "row", justifyContent: "space-around", marginTop: 14, marginBottom: 8 },
+  weekLabel: { color: colors.textFaint, fontSize: 11, fontWeight: "700", width: 32, textAlign: "center" },
+  calendarGrid: { flexDirection: "row", flexWrap: "wrap" },
+  dayCell: { width: "14.28%", aspectRatio: 1, padding: 2, alignItems: "center", justifyContent: "center" },
+  dayCircleRound: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  streakDayCellActive: { backgroundColor: colors.streakOrange },
+  periodCircleMarked: { backgroundColor: colors.periods },
+  streakDayFireIcon: { fontSize: 12 },
+  streakDayNumText: { color: "#FFF", fontSize: 10, fontWeight: "800", marginTop: -2 },
+  dayText: { color: colors.textMuted, fontSize: 12 },
+  squareMarker: { borderRadius: 8 },
+  todayCalendarBorder: { borderWidth: 1, borderColor: colors.streakOrange },
+  cardDivider: { height: 1, backgroundColor: colors.border, marginVertical: 12 },
+  hint: { color: colors.textFaint, fontSize: 11, textAlign: "center" },
+
   learningCard: {
     backgroundColor: colors.surface,
-    borderRadius: 14,
-    padding: 14,
+    borderRadius: 18,
+    padding: 16,
     borderWidth: 1,
     borderColor: colors.border,
   },
   learningHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   learningTitle: { color: colors.text, fontSize: 15, fontWeight: "700" },
-  learningCollapsedText: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
-  learningToggle: { fontSize: 22, fontWeight: "300" },
+  learningCollapsedText: { color: colors.textFaint, fontSize: 11, marginTop: 2 },
+  learningToggle: { fontSize: 20, fontWeight: "800" },
   learningInput: {
     backgroundColor: colors.surfaceRaised,
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 12,
     color: colors.text,
     fontSize: 14,
@@ -3072,63 +3087,247 @@ const s = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.border,
   },
-  learningSave: { borderRadius: 10, paddingVertical: 12, alignItems: "center", marginTop: 12 },
+  learningSave: { borderRadius: 12, paddingVertical: 10, alignItems: "center", marginTop: 12 },
+  learningEntry: {
+    backgroundColor: colors.surface,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 8,
+    flexDirection: "row",
+    alignItems: "flex-start",
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  learningEntryText: { color: colors.text, fontSize: 13, flex: 1, lineHeight: 18 },
+  learningEntryHint: { color: colors.textFaint, fontSize: 10, marginTop: 4 },
 
-  // Period Tracker Cycle Rows
+  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)" },
+  sheetWrap: { justifyContent: "flex-end", flex: 1 },
+  sheet: {
+    backgroundColor: colors.surfaceRaised,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 20,
+    borderTopWidth: 1,
+    borderColor: colors.border,
+  },
+  sheetCompact: {
+    backgroundColor: colors.surfaceRaised,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 20,
+    borderTopWidth: 1,
+    borderColor: colors.border,
+  },
+  grabber: { width: 36, height: 4, borderRadius: 2, backgroundColor: colors.border, alignSelf: "center", marginBottom: 16 },
+  modalHeaderTitle: { color: colors.text, fontSize: 18, fontWeight: "800", marginBottom: 14 },
+  label: { color: colors.textMuted, fontSize: 12, fontWeight: "600", marginTop: 10, marginBottom: 6 },
+  input: {
+    backgroundColor: colors.surface,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    color: colors.text,
+    fontSize: 14,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  emojiPreviewBox: {
+    width: 48,
+    height: 48,
+    borderRadius: 12,
+    backgroundColor: colors.surface,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  emojiPill: {
+    backgroundColor: colors.surface,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    marginRight: 6,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  saveBtn: { borderRadius: 12, paddingVertical: 12, alignItems: "center", marginTop: 16 },
+  saveBtnText: { color: "#FFF", fontSize: 14, fontWeight: "700" },
+
+  inputWrap: {
+    backgroundColor: colors.surface,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  dropdown: {
+    backgroundColor: colors.surfaceRaised,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginTop: 4,
+    maxHeight: 180,
+    overflow: "hidden",
+  },
+  row: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8 },
+  rowDot: { width: 6, height: 6, borderRadius: 3 },
+  rowText: { color: colors.text, fontSize: 13 },
+  addNew: { fontSize: 13, fontWeight: "600" },
+
+  bdHeaderRow: { flexDirection: "row", justifyContent: "space-between", marginBottom: 6 },
+  bdHeaderLabel: { color: colors.textFaint, fontSize: 11, fontWeight: "700" },
+  bdRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 4 },
+  bdItemText: { color: colors.text, fontSize: 13, flex: 1 },
+  bdAmountRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  bdAmountText: { color: colors.textMuted, fontSize: 13 },
+  bdRemove: { color: colors.negative, fontSize: 18, fontWeight: "700" },
+  bdAddRow: { flexDirection: "row", gap: 8, marginTop: 8 },
+  bdAddInput: {
+    backgroundColor: colors.surface,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    color: colors.text,
+    fontSize: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  bdAddBtn: { width: 32, height: 32, borderRadius: 8, alignItems: "center", justifyContent: "center" },
+  bdAddBtnText: { color: "#FFF", fontSize: 16, fontWeight: "700" },
+  bdTotalRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  bdTotalLabel: { color: colors.textMuted, fontSize: 12, fontWeight: "600" },
+  bdTotalValue: { fontSize: 14, fontWeight: "800" },
+
   cycleRow: {
     backgroundColor: colors.surface,
     borderRadius: 12,
     padding: 14,
+    marginBottom: 8,
     borderWidth: 1,
     borderColor: colors.border,
-    marginBottom: 8,
   },
   cycleRange: { color: colors.text, fontSize: 14, fontWeight: "600" },
 
-  // Reports
+  segment: {
+    flexDirection: "row",
+    backgroundColor: colors.surface,
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: 12,
+  },
+  segmentBtn: { flex: 1, paddingVertical: 8, borderRadius: 8, alignItems: "center" },
+  segmentText: { color: colors.textMuted, fontSize: 13, fontWeight: "600" },
+  segmentTextActive: { color: "#FFF", fontWeight: "800" },
+  quickEntryRow: { flexDirection: "row", gap: 10 },
+  quickTitleInput: { flex: 1.5 },
+  quickAmountInput: { flex: 1 },
+  breakdownBox: {
+    backgroundColor: colors.surface,
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+
+  swipeWrap: { marginBottom: 8, overflow: "hidden", borderRadius: 14 },
+  swipeBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: colors.negative,
+    justifyContent: "center",
+    paddingLeft: 20,
+    borderRadius: 14,
+  },
+  swipeDeleteLabel: { color: "#FFF", fontSize: 13, fontWeight: "800" },
+  entryCard: {
+    backgroundColor: colors.surface,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  entryRow: { flexDirection: "row", alignItems: "center", padding: 12 },
+  entryCardThumb: { width: 36, height: 36, borderRadius: 8, marginRight: 10 },
+  entryLeft: { flex: 1, flexDirection: "row", alignItems: "center", gap: 8 },
+  entryTitle: { color: colors.text, fontSize: 14, fontWeight: "700" },
+  entryCategory: { color: colors.textMuted, fontSize: 11, marginTop: 2 },
+  entryRight: { flexDirection: "row", alignItems: "center", gap: 10 },
+  entryAmount: { fontSize: 14, fontWeight: "800" },
+  entryDeleteX: { color: colors.textFaint, fontSize: 18, fontWeight: "700", paddingHorizontal: 4 },
+  entryBreakdownWrap: {
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    padding: 12,
+    backgroundColor: colors.surfaceRaised,
+    borderBottomLeftRadius: 14,
+    borderBottomRightRadius: 14,
+  },
+  entryBreakdownRow: { flexDirection: "row", justifyContent: "space-between", paddingVertical: 2 },
+  entryBreakdownLabel: { color: colors.textMuted, fontSize: 12 },
+  entryBreakdownAmount: { color: colors.text, fontSize: 12, fontWeight: "600" },
+
+  dateRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  dateDay: { color: colors.text, fontSize: 26, fontWeight: "900" },
+  balanceRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-end" },
+  balanceLabel: { color: colors.textFaint, fontSize: 10, fontWeight: "700" },
+  balanceValueSm: { color: colors.textMuted, fontSize: 14, fontWeight: "700", marginTop: 2 },
+  balanceValueLg: { color: colors.expense, fontSize: 18, fontWeight: "900", marginTop: 2 },
+  fab: {
+    position: "absolute",
+    right: 20,
+    bottom: BOTTOM_INSET + 20,
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: colors.expense,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  fabText: { color: "#FFF", fontSize: 28, fontWeight: "800", marginTop: -2 },
+
+  donutWrap: { alignItems: "center", justifyContent: "center", marginVertical: 10 },
+  donutCenter: { position: "absolute", alignItems: "center" },
+  donutTotal: { color: colors.text, fontSize: 18, fontWeight: "900" },
+  donutCaption: { color: colors.textMuted, fontSize: 10 },
+
   reportMetricsRow: { flexDirection: "row", justifyContent: "space-between" },
   reportMetricCol: { flex: 1 },
-  reportMetricValue: { fontSize: 16, fontWeight: "800", marginTop: 4 },
+  reportMetricValue: { fontSize: 15, fontWeight: "800", marginTop: 4 },
   reportCard: {
     backgroundColor: colors.surface,
-    borderRadius: 16,
+    borderRadius: 18,
     padding: 16,
     borderWidth: 1,
     borderColor: colors.border,
-    marginBottom: 16,
   },
-  reportRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-  },
-  reportRowLabel: { flexDirection: "row", alignItems: "center", gap: 10 },
-  barChartRow: { flexDirection: "row", alignItems: "center", gap: 10, marginVertical: 6 },
-  barChartLabel: { color: colors.text, fontSize: 12, width: 80 },
+  reportRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 6 },
+  reportRowLabel: { flexDirection: "row", alignItems: "center", gap: 8 },
+  reportCategoryText: { color: colors.textMuted, fontSize: 13, fontWeight: "600" },
+  barChartRow: { flexDirection: "row", alignItems: "center", marginVertical: 6, gap: 10 },
+  barChartLabel: { color: colors.textMuted, fontSize: 12, width: 90 },
   barTrack: { flex: 1, height: 8, backgroundColor: colors.surfaceRaised, borderRadius: 4, overflow: "hidden" },
   barFill: { height: "100%", borderRadius: 4 },
-  barAmount: { color: colors.textMuted, fontSize: 12, fontWeight: "600", width: 50, textAlign: "right" },
-  donutWrap: { alignItems: "center", justifyContent: "center", paddingVertical: 10 },
-  donutCenter: { position: "absolute", alignItems: "center" },
-  donutTotal: { color: colors.text, fontSize: 18, fontWeight: "800" },
-  donutCaption: { color: colors.textMuted, fontSize: 11 },
+  barAmount: { color: colors.text, fontSize: 12, fontWeight: "700", width: 50, textAlign: "right" },
 
-  // Buy Section
   buyCard: {
     backgroundColor: colors.surface,
-    borderRadius: 16,
-    padding: 14,
+    borderRadius: 18,
+    padding: 16,
+    marginVertical: 8,
     borderWidth: 1,
     borderColor: colors.border,
-    marginTop: 8,
   },
   buyHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   buyTitle: { color: colors.text, fontSize: 15, fontWeight: "700" },
-  buyToggleBtn: { paddingHorizontal: 8, paddingVertical: 2 },
-  buyToggleIcon: { color: colors.textMuted, fontSize: 20, fontWeight: "300" },
+  buyToggleBtn: { padding: 4 },
+  buyToggleIcon: { color: colors.notes, fontSize: 20, fontWeight: "800" },
   buyInputRow: { flexDirection: "row", gap: 8, marginBottom: 10 },
   buyInput: {
     flex: 1,
@@ -3142,24 +3341,17 @@ const s = StyleSheet.create({
     borderColor: colors.border,
   },
   buyAddBtn: {
-    backgroundColor: colors.notes,
-    width: 38,
-    height: 38,
+    width: 36,
+    height: 36,
     borderRadius: 10,
+    backgroundColor: colors.notes,
     alignItems: "center",
     justifyContent: "center",
   },
-  buyAddBtnText: { color: "#FFFFFF", fontSize: 20, fontWeight: "600" },
-  buyItemRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-  },
-  buyItemText: { color: colors.text, fontSize: 14 },
-  buyItemTextCompleted: { textDecorationLine: "line-through", color: colors.textFaint },
+  buyAddBtnText: { color: "#FFF", fontSize: 18, fontWeight: "800" },
+  buyItemRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 6 },
+  buyItemText: { color: colors.text, fontSize: 13, flex: 1 },
+  buyItemTextCompleted: { color: colors.textFaint, textDecorationLine: "line-through" },
   buyCheckbox: {
     width: 22,
     height: 22,
@@ -3169,162 +3361,37 @@ const s = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  buyCheckboxCompleted: { backgroundColor: colors.habitGreen, borderColor: colors.habitGreen },
-  buyCheckmark: { color: "#FFFFFF", fontSize: 12, fontWeight: "800" },
+  buyCheckboxCompleted: { backgroundColor: colors.notes, borderColor: colors.notes },
+  buyCheckmark: { color: "#FFF", fontSize: 12, fontWeight: "800" },
 
-  // Notes Cards
-  noteCard: {
-    backgroundColor: colors.surface,
-    borderRadius: 16,
-    padding: 14,
-    borderWidth: 1,
-    borderColor: colors.border,
-    marginBottom: 12,
-    ...cardShadow,
-  },
-  noteCardBanner: { width: "100%", height: 60, borderRadius: 10, marginBottom: 10, resizeMode: "cover" },
-  noteCardTitle: { color: colors.text, fontSize: 16, fontWeight: "700" },
-  notePreview: { color: colors.textMuted, fontSize: 13, marginTop: 4 },
-
-  // Modals & Bottom Sheets
-  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.7)" },
-  sheetWrap: { justifyContent: "flex-end" },
-  sheet: {
-    backgroundColor: colors.surface,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    padding: 20,
-    maxHeight: "85%",
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
   noteSheet: {
-    backgroundColor: colors.surface,
+    backgroundColor: colors.surfaceRaised,
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     padding: 20,
     height: "80%",
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  grabber: {
-    width: 36,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: colors.borderLight,
-    alignSelf: "center",
-    marginBottom: 16,
-  },
-  modalHeaderTitle: { color: colors.text, fontSize: 18, fontWeight: "800", marginBottom: 16 },
-  label: { color: colors.textMuted, fontSize: 12, fontWeight: "600", textTransform: "uppercase", marginTop: 12, marginBottom: 6 },
-  inputWrap: {
-    backgroundColor: colors.surfaceRaised,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  input: { color: colors.text, fontSize: 14, paddingHorizontal: 14, paddingVertical: 10 },
-  dropdown: {
-    backgroundColor: colors.surfaceRaised,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    marginTop: 4,
-    overflow: "hidden",
-  },
-  row: { flexDirection: "row", alignItems: "center", gap: 10, padding: 12, borderBottomWidth: 1, borderBottomColor: colors.border },
-  rowDot: { width: 6, height: 6, borderRadius: 3 },
-  rowText: { color: colors.text, fontSize: 14 },
-  addNew: { fontWeight: "600", fontSize: 14 },
-  quickEntryRow: { flexDirection: "row", gap: 10 },
-  quickTitleInput: { flex: 1.4 },
-  quickAmountInput: { flex: 0.8 },
-  breakdownBox: {
-    backgroundColor: colors.surfaceRaised,
-    borderRadius: 12,
-    padding: 12,
-    marginVertical: 10,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  bdHeaderRow: { flexDirection: "row", justifyContent: "space-between", marginBottom: 6 },
-  bdHeaderLabel: { color: colors.textFaint, fontSize: 11, fontWeight: "600" },
-  bdRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 4 },
-  bdItemText: { color: colors.text, fontSize: 13, flex: 1 },
-  bdAmountRow: { flexDirection: "row", alignItems: "center", gap: 8 },
-  bdAmountText: { color: colors.text, fontSize: 13, fontWeight: "600" },
-  bdRemove: { color: colors.textFaint, fontSize: 18, fontWeight: "300" },
-  bdAddRow: { flexDirection: "row", gap: 8, marginTop: 8 },
-  bdAddInput: {
-    backgroundColor: colors.surface,
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    color: colors.text,
-    fontSize: 13,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  bdAddBtn: { width: 32, height: 32, borderRadius: 8, alignItems: "center", justifyContent: "center" },
-  bdAddBtnText: { color: "#FFFFFF", fontSize: 18, fontWeight: "600" },
-  bdTotalRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginTop: 10,
-    paddingTop: 8,
     borderTopWidth: 1,
-    borderTopColor: colors.border,
+    borderColor: colors.border,
   },
-  bdTotalLabel: { color: colors.textMuted, fontSize: 12, fontWeight: "600" },
-  bdTotalValue: { fontSize: 14, fontWeight: "800" },
-  saveBtn: { borderRadius: 12, paddingVertical: 14, alignItems: "center", marginTop: 18 },
-  saveBtnText: { color: "#FFFFFF", fontSize: 15, fontWeight: "700" },
-  segment: {
+  noteTitleInput: {
+    color: colors.text,
+    fontSize: 20,
+    fontWeight: "800",
+    marginBottom: 12,
+    paddingVertical: 4,
+  },
+  noteBodyInput: { color: colors.text, fontSize: 14, flex: 1, lineHeight: 20 },
+  noteBannerCard: {
+    backgroundColor: colors.surface,
+    borderRadius: 16,
+    marginVertical: 6,
     flexDirection: "row",
-    backgroundColor: colors.surfaceRaised,
-    borderRadius: 12,
-    padding: 4,
-    marginBottom: 10,
-  },
-  segmentBtn: { flex: 1, paddingVertical: 8, alignItems: "center", borderRadius: 8 },
-  segmentText: { color: colors.textMuted, fontSize: 13, fontWeight: "600" },
-  segmentTextActive: { color: "#FFFFFF", fontWeight: "700" },
-  emojiPreviewBox: {
-    width: 48,
-    height: 48,
-    borderRadius: 12,
-    backgroundColor: colors.surfaceRaised,
+    overflow: "hidden",
     borderWidth: 1,
     borderColor: colors.border,
-    alignItems: "center",
-    justifyContent: "center",
   },
-  emojiPill: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 12,
-    backgroundColor: colors.surfaceRaised,
-    borderWidth: 1,
-    borderColor: colors.border,
-    marginRight: 8,
-  },
-
-  // Note Editor Specific
-  noteTitleInput: { color: colors.text, fontSize: 20, fontWeight: "800", marginBottom: 12 },
-  noteBodyInput: { color: colors.text, fontSize: 15, flex: 1, lineHeight: 22 },
-
-  // Floating Action Button
-  fab: {
-    position: "absolute",
-    bottom: BOTTOM_INSET + 20,
-    right: 20,
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    backgroundColor: colors.expense,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  fabText: { color: "#FFFFFF", fontSize: 28, fontWeight: "300", marginTop: -2 },
+  noteBannerImage: { width: 80, height: 80 },
+  noteBannerContent: { flex: 1, padding: 12, justifyContent: "center" },
+  noteBannerTitle: { color: colors.text, fontSize: 15, fontWeight: "700" },
+  noteBannerPreview: { color: colors.textMuted, fontSize: 12, marginTop: 4 },
 });
