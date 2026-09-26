@@ -6,8 +6,10 @@
     "orientation": "portrait",
     "icon": "./assets/android-icon-foreground.png",
     "userInterfaceStyle": "light",
+    "scheme": "winnie",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.preeth.winnie"
     },
     "android": {
       "package": "com.preeth.winnie",
@@ -22,7 +24,8 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-web-browser"
     ],
     "extra": {
       "eas": {

@@ -34,6 +34,13 @@ import {
 import * as SQLite from "expo-sqlite";
 import Svg, { Circle } from "react-native-svg";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import * as WebBrowser from "expo-web-browser";
+import * as Google from "expo-auth-session/providers/google";
+import { makeRedirectUri } from "expo-auth-session";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import Constants, { AppOwnership } from "expo-constants";
+
+WebBrowser.maybeCompleteAuthSession();
 
 // ───────────── LOCAL ASSETS MAP ─────────────
 const LOCAL_ASSETS = {
@@ -214,6 +221,270 @@ function computeCycles(sortedDates) {
   return cycles.reverse();
 }
 
+// ───────────── GOOGLE OAUTH & SHEETS CLOUD SYNC ─────────────
+export const GOOGLE_CONFIG = {
+  // Google Cloud Console OAuth 2.0 Client IDs
+  webClientId: "938746787260-8oujjq047r5ut4h43mj1sltu0m9fes3g.apps.googleusercontent.com",
+  androidClientId: "938746787260-ljedj551hbtgf36ohdtgpvpdlu441q90.apps.googleusercontent.com",
+  iosClientId: "938746787260-8oujjq047r5ut4h43mj1sltu0m9fes3g.apps.googleusercontent.com",
+};
+
+const STORAGE_KEYS = {
+  TOKEN: "@winnie_auth_token",
+  USER: "@winnie_user_profile",
+  GENDER: "@winnie_user_gender",
+  SHEET_ID: "@winnie_sheet_id",
+};
+
+export async function getStoredAuth() {
+  try {
+    const [token, userStr, gender, sheetId] = await Promise.all([
+      AsyncStorage.getItem(STORAGE_KEYS.TOKEN),
+      AsyncStorage.getItem(STORAGE_KEYS.USER),
+      AsyncStorage.getItem(STORAGE_KEYS.GENDER),
+      AsyncStorage.getItem(STORAGE_KEYS.SHEET_ID),
+    ]);
+    return {
+      token,
+      user: userStr ? JSON.parse(userStr) : null,
+      gender,
+      sheetId,
+    };
+  } catch {
+    return { token: null, user: null, gender: null, sheetId: null };
+  }
+}
+
+export async function saveAuthData({ token, user, gender, sheetId }) {
+  try {
+    const pairs = [];
+    if (token !== undefined) pairs.push([STORAGE_KEYS.TOKEN, token || ""]);
+    if (user !== undefined) pairs.push([STORAGE_KEYS.USER, user ? JSON.stringify(user) : ""]);
+    if (gender !== undefined) pairs.push([STORAGE_KEYS.GENDER, gender || ""]);
+    if (sheetId !== undefined) pairs.push([STORAGE_KEYS.SHEET_ID, sheetId || ""]);
+    if (pairs.length > 0) {
+      await AsyncStorage.multiSet(pairs);
+    }
+  } catch (e) {
+    console.log("[Auth] Error saving auth data:", e);
+  }
+}
+
+export async function clearAuthData() {
+  try {
+    await AsyncStorage.multiRemove([
+      STORAGE_KEYS.TOKEN,
+      STORAGE_KEYS.USER,
+      STORAGE_KEYS.GENDER,
+      STORAGE_KEYS.SHEET_ID,
+    ]);
+    activeToken = null;
+    activeSheetId = null;
+  } catch (e) {
+    console.log("[Auth] Error clearing auth data:", e);
+  }
+}
+
+const SHEETS_SPREADSHEET_NAME = "WinnieApp_Data";
+let activeToken = null;
+let activeSheetId = null;
+
+export function setSheetsContext(token, sheetId) {
+  activeToken = token;
+  activeSheetId = sheetId;
+}
+
+const TABLE_COLUMNS = {
+  profile: ["email", "name", "gender", "updated_at"],
+  expenses: ["id", "date", "type", "category_id", "title", "amount"],
+  expense_breakdown_items: ["id", "expense_id", "label", "amount", "sort_order"],
+  tags: ["id", "kind", "name", "usage_count"],
+  rituals: ["id", "name", "emoji", "sort_order"],
+  ritual_logs: ["date", "ritual_id", "completed"],
+  daily_checkins: ["date", "studied", "ate_healthy"],
+  period_days: ["date"],
+  learning_notes: ["id", "date", "body", "created_at", "updated_at"],
+  notes: ["id", "title", "body", "created_at", "updated_at"],
+  buy_items: ["id", "title", "completed", "created_at"],
+};
+
+export async function createOrFindSpreadsheet(token) {
+  if (!token) return null;
+  try {
+    const searchRes = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=name%3D'${SHEETS_SPREADSHEET_NAME}'%20and%20trashed%3Dfalse&fields=files(id,name)`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+    if (searchRes.ok) {
+      const searchData = await searchRes.json();
+      if (searchData.files && searchData.files.length > 0) {
+        return searchData.files[0].id;
+      }
+    }
+
+    const sheetTitles = Object.keys(TABLE_COLUMNS);
+    const createRes = await fetch("https://sheets.googleapis.com/v4/spreadsheets", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        properties: { title: SHEETS_SPREADSHEET_NAME },
+        sheets: sheetTitles.map((title) => ({
+          properties: { title },
+        })),
+      }),
+    });
+
+    if (!createRes.ok) {
+      return null;
+    }
+
+    const createData = await createRes.json();
+    const newSheetId = createData.spreadsheetId;
+
+    const dataUpdates = sheetTitles.map((title) => ({
+      range: `${title}!A1`,
+      majorDimension: "ROWS",
+      values: [TABLE_COLUMNS[title]],
+    }));
+
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${newSheetId}/values:batchUpdate`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          valueInputOption: "USER_ENTERED",
+          data: dataUpdates,
+        }),
+      }
+    );
+
+    return newSheetId;
+  } catch (err) {
+    console.log("[SheetsSync] Error creating/finding spreadsheet:", err);
+    return null;
+  }
+}
+
+export async function syncTableToSheet(tableName) {
+  if (!activeToken || !activeSheetId) return;
+  const columns = TABLE_COLUMNS[tableName];
+  if (!columns) return;
+
+  try {
+    const db = await getDb();
+    let rows = [];
+    if (tableName === "profile") {
+      const auth = await getStoredAuth();
+      if (auth.user) {
+        rows = [[auth.user.email || "", auth.user.name || "", auth.gender || "", new Date().toISOString()]];
+      }
+    } else {
+      const colsSql = columns.join(", ");
+      rows = await db.getAllAsync(`SELECT ${colsSql} FROM ${tableName}`);
+      rows = rows.map((r) => columns.map((col) => (r[col] !== undefined && r[col] !== null ? String(r[col]) : "")));
+    }
+
+    const values = [columns, ...rows];
+
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${activeSheetId}/values/${encodeURIComponent(tableName)}:clear`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${activeToken}` },
+      }
+    ).catch(() => {});
+
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${activeSheetId}/values/${encodeURIComponent(tableName)}!A1?valueInputOption=USER_ENTERED`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${activeToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          range: `${tableName}!A1`,
+          majorDimension: "ROWS",
+          values,
+        }),
+      }
+    );
+  } catch (err) {
+    console.log(`[SheetsSync] Sync error for ${tableName}:`, err?.message || err);
+  }
+}
+
+const syncDebounceTimers = {};
+export function triggerTableSync(tableName, delay = 800) {
+  if (syncDebounceTimers[tableName]) {
+    clearTimeout(syncDebounceTimers[tableName]);
+  }
+  syncDebounceTimers[tableName] = setTimeout(() => {
+    syncTableToSheet(tableName).catch(() => {});
+  }, delay);
+}
+
+export async function restoreAllFromSheets(token, sheetId) {
+  if (!token || !sheetId) return null;
+  try {
+    const ranges = Object.keys(TABLE_COLUMNS)
+      .map((t) => `ranges=${encodeURIComponent(t)}!A1:Z`)
+      .join("&");
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchGet?${ranges}`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.valueRanges) return null;
+
+    const db = await getDb();
+    let restoredGender = null;
+
+    for (const vr of data.valueRanges) {
+      const title = (vr.range || "").split("!")[0].replace(/'/g, "");
+      const values = vr.values || [];
+      if (values.length <= 1) continue;
+      const header = values[0];
+      const dataRows = values.slice(1);
+
+      if (title === "profile") {
+        const genderIdx = header.indexOf("gender");
+        if (genderIdx !== -1 && dataRows[0] && dataRows[0][genderIdx]) {
+          restoredGender = dataRows[0][genderIdx];
+        }
+        continue;
+      }
+
+      const countRes = await db.getFirstAsync(`SELECT COUNT(*) as c FROM ${title}`);
+      if (!countRes || countRes.c === 0) {
+        const cols = header.join(", ");
+        const placeholders = header.map(() => "?").join(", ");
+        for (const row of dataRows) {
+          const rowVals = header.map((_, i) => (row[i] !== undefined ? row[i] : ""));
+          await db.runAsync(`INSERT OR REPLACE INTO ${title} (${cols}) VALUES (${placeholders})`, rowVals);
+        }
+      }
+    }
+
+    return { gender: restoredGender };
+  } catch (e) {
+    console.log("[SheetsSync] Error restoring data:", e);
+    return null;
+  }
+}
+
 // ───────────── DATABASE ─────────────
 let dbInstance = null;
 async function getDb() {
@@ -351,6 +622,7 @@ async function addRitual(name, emoji) {
     emoji.trim() || "✨",
     sort_order,
   ]);
+  triggerTableSync("rituals");
   return res.lastInsertRowId;
 }
 async function updateRitual(id, name, emoji) {
@@ -360,11 +632,14 @@ async function updateRitual(id, name, emoji) {
     emoji.trim() || "✨",
     id,
   ]);
+  triggerTableSync("rituals");
 }
 async function deleteRitual(id) {
   const db = await getDb();
   await db.runAsync(`DELETE FROM ritual_logs WHERE ritual_id = ?`, [id]);
   await db.runAsync(`DELETE FROM rituals WHERE id = ?`, [id]);
+  triggerTableSync("rituals");
+  triggerTableSync("ritual_logs");
 }
 async function toggleRitualLog(date, ritualId) {
   const db = await getDb();
@@ -412,6 +687,8 @@ async function toggleRitualLog(date, ritualId) {
     }
   }
 
+  triggerTableSync("ritual_logs");
+  triggerTableSync("daily_checkins");
   return isCompleted;
 }
 async function getRitualLogsForDates(dates) {
@@ -533,11 +810,13 @@ async function getOrCreateTag(kind, name) {
     kind,
     trimmed,
   ]);
+  triggerTableSync("tags");
   return { id: result.lastInsertRowId, kind, name: trimmed, usage_count: 0 };
 }
 async function bumpTagUsage(tagId) {
   const db = await getDb();
   await db.runAsync(`UPDATE tags SET usage_count = usage_count + 1 WHERE id = ?`, [tagId]);
+  triggerTableSync("tags");
 }
 
 // ───────────── EXPENSE QUERIES ─────────────
@@ -615,6 +894,8 @@ async function addExpense(entry) {
     }
   }
   if (entry.categoryId) await bumpTagUsage(entry.categoryId);
+  triggerTableSync("expenses");
+  triggerTableSync("expense_breakdown_items");
   return expenseId;
 }
 async function updateExpense(id, entry) {
@@ -638,10 +919,14 @@ async function updateExpense(id, entry) {
     }
   }
   if (entry.categoryId) await bumpTagUsage(entry.categoryId);
+  triggerTableSync("expenses");
+  triggerTableSync("expense_breakdown_items");
 }
 async function deleteExpense(id) {
   const db = await getDb();
   await db.runAsync(`DELETE FROM expenses WHERE id = ?`, [id]);
+  triggerTableSync("expenses");
+  triggerTableSync("expense_breakdown_items");
 }
 
 // ───────────── PERIODS QUERIES ─────────────
@@ -657,6 +942,7 @@ async function togglePeriodDay(date) {
   } else {
     await db.runAsync(`INSERT INTO period_days (date) VALUES (?)`, [date]);
   }
+  triggerTableSync("period_days");
 }
 
 // ───────────── BUY ITEMS QUERIES ─────────────
@@ -667,6 +953,7 @@ async function listBuyItems() {
 async function addBuyItem(title) {
   const db = await getDb();
   const result = await db.runAsync(`INSERT INTO buy_items (title, completed) VALUES (?, 0)`, [title.trim()]);
+  triggerTableSync("buy_items");
   return result.lastInsertRowId;
 }
 async function toggleBuyItem(id) {
@@ -675,11 +962,13 @@ async function toggleBuyItem(id) {
   if (item) {
     const nextVal = item.completed ? 0 : 1;
     await db.runAsync(`UPDATE buy_items SET completed=? WHERE id=?`, [nextVal, id]);
+    triggerTableSync("buy_items");
   }
 }
 async function deleteBuyItem(id) {
   const db = await getDb();
   await db.runAsync(`DELETE FROM buy_items WHERE id=?`, [id]);
+  triggerTableSync("buy_items");
 }
 
 // ───────────── DAILY LEARNING NOTES ─────────────
@@ -689,16 +978,20 @@ async function listLearningNotes(date) {
 }
 async function saveLearningEntry(id, date, body) {
   const db = await getDb();
+  let resultId = id;
   if (id) {
     await db.runAsync(`UPDATE learning_notes SET body=?, updated_at=datetime('now') WHERE id=?`, [body, id]);
-    return id;
+  } else {
+    const result = await db.runAsync(`INSERT INTO learning_notes (date, body) VALUES (?,?)`, [date, body]);
+    resultId = result.lastInsertRowId;
   }
-  const result = await db.runAsync(`INSERT INTO learning_notes (date, body) VALUES (?,?)`, [date, body]);
-  return result.lastInsertRowId;
+  triggerTableSync("learning_notes");
+  return resultId;
 }
 async function deleteLearningEntry(id) {
   const db = await getDb();
   await db.runAsync(`DELETE FROM learning_notes WHERE id=?`, [id]);
+  triggerTableSync("learning_notes");
 }
 
 // ───────────── NOTES QUERIES ─────────────
@@ -708,16 +1001,20 @@ async function listNotes() {
 }
 async function saveNote(note) {
   const db = await getDb();
+  let resultId = note.id;
   if (note.id) {
     await db.runAsync(`UPDATE notes SET title=?, body=?, updated_at=datetime('now') WHERE id=?`, [note.title, note.body, note.id]);
-    return note.id;
+  } else {
+    const result = await db.runAsync(`INSERT INTO notes (title, body) VALUES (?,?)`, [note.title, note.body]);
+    resultId = result.lastInsertRowId;
   }
-  const result = await db.runAsync(`INSERT INTO notes (title, body) VALUES (?,?)`, [note.title, note.body]);
-  return result.lastInsertRowId;
+  triggerTableSync("notes");
+  return resultId;
 }
 async function deleteNote(id) {
   const db = await getDb();
   await db.runAsync(`DELETE FROM notes WHERE id=?`, [id]);
+  triggerTableSync("notes");
 }
 
 // ───────────── HEADER & MENU BUTTON ─────────────
@@ -743,7 +1040,7 @@ function ScreenHeader({ title, onMenuPress, iconKey }) {
 }
 
 // ───────────── DRAWER NAVIGATION ─────────────
-function Drawer({ visible, onClose, activeTab, onSelectTab, tabs }) {
+function Drawer({ visible, onClose, activeTab, onSelectTab, tabs, userProfile, onSignOut }) {
   const translateX = useRef(new Animated.Value(-320)).current;
   const backdropOpacity = useRef(new Animated.Value(0)).current;
   const [modalVisible, setModalVisible] = useState(false);
@@ -814,6 +1111,36 @@ function Drawer({ visible, onClose, activeTab, onSelectTab, tabs }) {
               );
             })}
           </View>
+
+          {userProfile && (
+            <View style={{ marginTop: "auto", marginBottom: BOTTOM_INSET + 10, paddingTop: 16, borderTopWidth: 1, borderTopColor: colors.border }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 6, marginBottom: 12 }}>
+                <View style={[s.drawerAvatarPlaceholder, { backgroundColor: colors.surfaceHighlight }]}>
+                  <Text style={{ color: colors.text, fontWeight: "700", fontSize: 14 }}>
+                    {(userProfile.name || userProfile.email || "W")[0].toUpperCase()}
+                  </Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ color: colors.text, fontSize: 13, fontWeight: "700" }} numberOfLines={1}>
+                    {userProfile.name || "Explorer"}
+                  </Text>
+                  <Text style={{ color: colors.textFaint, fontSize: 11 }} numberOfLines={1}>
+                    {userProfile.email || ""}
+                  </Text>
+                </View>
+              </View>
+              <TouchableOpacity
+                onPress={() => {
+                  onClose();
+                  if (onSignOut) onSignOut();
+                }}
+                style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 10, backgroundColor: "rgba(239, 68, 68, 0.12)" }}
+                activeOpacity={0.7}
+              >
+                <Text style={{ color: colors.negative, fontSize: 13, fontWeight: "700" }}>Sign Out 🚪</Text>
+              </TouchableOpacity>
+            </View>
+          )}
         </Animated.View>
       </GestureHandlerRootView>
     </Modal>
@@ -2726,16 +3053,302 @@ const TABS = [
   { key: "health", label: "Period Tracker", accent: colors.periods },
 ];
 
+// ───────────── LOGIN SCREEN ─────────────
+function LoginScreen({ onGoogleLogin, onDemoLogin, loading, authError }) {
+  return (
+    <View style={s.authScreen}>
+      <ScrollView contentContainerStyle={s.authScrollContent} showsVerticalScrollIndicator={false}>
+        <View style={s.authLogoBox}>
+          <Image source={LOCAL_ASSETS.winnie} style={s.authLogoImage} />
+        </View>
+
+        <Text style={s.authTitle}>Winnie 🐾</Text>
+        <Text style={s.authTagline}>Daily Rhythm & Life Tracker</Text>
+
+        <View style={[s.authFeatureCard, cardShadow]}>
+          <View style={s.authFeatureRow}>
+            <Text style={{ fontSize: 20 }}>🔥</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={s.authFeatureTitle}>Habits & Streaks</Text>
+              <Text style={s.authFeatureSub}>Build unbreakable consistency with daily rituals</Text>
+            </View>
+          </View>
+          <View style={s.authFeatureRow}>
+            <Text style={{ fontSize: 20 }}>💳</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={s.authFeatureTitle}>Smart Finance</Text>
+              <Text style={s.authFeatureSub}>Track daily expenses, incomes & cashflow breakdowns</Text>
+            </View>
+          </View>
+          <View style={s.authFeatureRow}>
+            <Text style={{ fontSize: 20 }}>📊</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={s.authFeatureTitle}>Google Sheets Cloud Sync</Text>
+              <Text style={s.authFeatureSub}>Safe & permanent storage in your personal Google account</Text>
+            </View>
+          </View>
+        </View>
+
+        {authError ? (
+          <View style={s.authErrorBanner}>
+            <Text style={s.authErrorText}>{authError}</Text>
+          </View>
+        ) : null}
+
+        <TouchableOpacity
+          onPress={onGoogleLogin}
+          disabled={loading}
+          style={[s.googleBtn, loading && { opacity: 0.7 }]}
+          activeOpacity={0.8}
+        >
+          <Text style={{ fontSize: 20 }}>🔑</Text>
+          <Text style={s.googleBtnText}>
+            {loading ? "Connecting to Google… ⏳" : "Sign in with Google"}
+          </Text>
+        </TouchableOpacity>
+
+        <Text style={s.authPrivacyNote}>
+          Your data lives privately in your Google Drive spreadsheet. No third-party servers. 🔒
+        </Text>
+
+        <TouchableOpacity
+          onPress={onDemoLogin}
+          style={s.demoBtn}
+          activeOpacity={0.7}
+        >
+          <Text style={s.demoBtnText}>⚡ Continue as Guest / Demo</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </View>
+  );
+}
+
+// ───────────── GENDER SELECTION SCREEN ─────────────
+function GenderSelectScreen({ userName, onSelectGender }) {
+  const [selected, setSelected] = useState(null);
+
+  return (
+    <View style={s.authScreen}>
+      <ScrollView contentContainerStyle={s.authScrollContent} showsVerticalScrollIndicator={false}>
+        <View style={s.genderHeaderBox}>
+          <Text style={s.genderGreeting}>Welcome, {userName || "Champ"}! 👋</Text>
+          <Text style={s.genderSub}>
+            Please select your gender to personalize your trackers & experience:
+          </Text>
+        </View>
+
+        <TouchableOpacity
+          onPress={() => setSelected("male")}
+          style={[
+            s.genderOptionCard,
+            cardShadow,
+            selected === "male" && s.genderOptionCardSelected,
+          ]}
+          activeOpacity={0.85}
+        >
+          <View style={s.genderOptionEmojiWrap}>
+            <Text style={{ fontSize: 36 }}>👦</Text>
+          </View>
+          <View style={{ flex: 1 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+              <Text style={s.genderOptionTitle}>Male</Text>
+              {selected === "male" && <Text style={{ color: colors.streakOrange, fontWeight: "800" }}>✓ Selected</Text>}
+            </View>
+            <Text style={s.genderOptionDesc}>
+              Tailored layout for daily habits, study streaks, expenses & personal notes.
+            </Text>
+          </View>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          onPress={() => setSelected("female")}
+          style={[
+            s.genderOptionCard,
+            cardShadow,
+            selected === "female" && s.genderOptionCardSelectedFemale,
+          ]}
+          activeOpacity={0.85}
+        >
+          <View style={s.genderOptionEmojiWrap}>
+            <Text style={{ fontSize: 36 }}>👧</Text>
+          </View>
+          <View style={{ flex: 1 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+              <Text style={[s.genderOptionTitle, selected === "female" && { color: colors.periods }]}>Female</Text>
+              {selected === "female" && <Text style={{ color: colors.periods, fontWeight: "800" }}>✓ Selected</Text>}
+            </View>
+            <Text style={s.genderOptionDesc}>
+              Includes full Cycle & Period Health Tracker 🌸 alongside habits & expenses.
+            </Text>
+          </View>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          onPress={() => selected && onSelectGender(selected)}
+          disabled={!selected}
+          style={[
+            s.genderContinueBtn,
+            !selected && { opacity: 0.4 },
+          ]}
+          activeOpacity={0.8}
+        >
+          <Text style={s.genderContinueBtnText}>Confirm & Launch Winnie 🚀</Text>
+        </TouchableOpacity>
+
+        <Text style={s.genderNote}>
+          This setting can also be switched anytime in your drawer profile.
+        </Text>
+      </ScrollView>
+    </View>
+  );
+}
+
 export default function App() {
   const [ready, setReady] = useState(false);
+  const [authStep, setAuthStep] = useState("loading"); // "loading" | "login" | "gender" | "main"
+  const [authData, setAuthData] = useState(null); // { token, user, gender, sheetId }
   const [tab, setTab] = useState("home");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState(null);
+
+  const isExpoGo =
+    Constants.appOwnership === AppOwnership?.Expo ||
+    Constants.appOwnership === "expo" ||
+    Constants.executionEnvironment === "storeClient";
+
+  const [request, response, promptAsync] = Google.useAuthRequest({
+    clientId: GOOGLE_CONFIG.webClientId,
+    webClientId: GOOGLE_CONFIG.webClientId,
+    // Native client IDs only work in standalone APK / IPA where package name matches:
+    androidClientId: isExpoGo ? undefined : GOOGLE_CONFIG.androidClientId,
+    iosClientId: isExpoGo ? undefined : GOOGLE_CONFIG.iosClientId,
+    scopes: [
+      "openid",
+      "https://www.googleapis.com/auth/userinfo.profile",
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive.file",
+    ],
+  });
 
   useEffect(() => {
-    initDatabase().then(() => setReady(true));
+    if (request?.redirectUri) {
+      console.log("[GoogleAuth] Active Redirect URI:", request.redirectUri);
+    }
+  }, [request]);
+
+  useEffect(() => {
+    if (response?.type === "success") {
+      const { authentication, params } = response;
+      const token = authentication?.accessToken || params?.access_token;
+      if (token) {
+        handleGoogleToken(token);
+      }
+    } else if (response?.type === "error") {
+      setAuthLoading(false);
+      setAuthError(response.error?.message || "Google sign-in was cancelled or failed.");
+    }
+  }, [response]);
+
+  async function handleGoogleToken(token) {
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      const userRes = await fetch("https://www.googleapis.com/userinfo/v2/me", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const userInfo = userRes.ok ? await userRes.json() : { name: "User", email: "" };
+
+      const sheetId = await createOrFindSpreadsheet(token);
+      if (sheetId) {
+        setSheetsContext(token, sheetId);
+      }
+
+      const restoreRes = sheetId ? await restoreAllFromSheets(token, sheetId) : null;
+      const stored = await getStoredAuth();
+      const resolvedGender = restoreRes?.gender || stored.gender;
+
+      const newAuth = {
+        token,
+        user: userInfo,
+        gender: resolvedGender || null,
+        sheetId,
+      };
+
+      await saveAuthData(newAuth);
+      setAuthData(newAuth);
+
+      if (resolvedGender) {
+        setAuthStep("main");
+      } else {
+        setAuthStep("gender");
+      }
+    } catch (e) {
+      console.log("[Auth] Error handling Google sign-in:", e);
+      setAuthError("Failed to initialize Google Sheets. Check your network connection.");
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    (async () => {
+      await initDatabase();
+      const stored = await getStoredAuth();
+      if (stored.token || stored.user) {
+        if (stored.token && stored.sheetId) {
+          setSheetsContext(stored.token, stored.sheetId);
+        }
+        setAuthData(stored);
+        if (stored.gender) {
+          setAuthStep("main");
+        } else {
+          setAuthStep("gender");
+        }
+      } else {
+        setAuthStep("login");
+      }
+      setReady(true);
+    })();
   }, []);
 
-  if (!ready) {
+  async function handleSelectGender(chosenGender) {
+    const updated = {
+      ...(authData || {}),
+      gender: chosenGender,
+    };
+    await saveAuthData(updated);
+    setAuthData(updated);
+    triggerTableSync("profile", 100);
+    setAuthStep("main");
+  }
+
+  async function handleSignOut() {
+    await clearAuthData();
+    setAuthData(null);
+    setTab("home");
+    setAuthStep("login");
+  }
+
+  function handleDemoLogin() {
+    const demoUser = {
+      name: "Adventurer",
+      email: "explorer@winnie.app",
+      id: "demo-user",
+    };
+    const newAuth = {
+      token: "demo-token",
+      user: demoUser,
+      gender: null,
+      sheetId: "demo-sheet",
+    };
+    saveAuthData(newAuth);
+    setAuthData(newAuth);
+    setAuthStep("gender");
+  }
+
+  if (!ready || authStep === "loading") {
     return (
       <GestureHandlerRootView style={{ flex: 1 }}>
         <View style={[s.screen, { alignItems: "center", justifyContent: "center" }]}>
@@ -2744,6 +3357,46 @@ export default function App() {
       </GestureHandlerRootView>
     );
   }
+
+  if (authStep === "login") {
+    return (
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
+        <LoginScreen
+          onGoogleLogin={() => {
+            setAuthError(null);
+            if (GOOGLE_CONFIG.webClientId.includes("YOUR_WEB_CLIENT_ID")) {
+              setAuthError("Google OAuth Client ID is not configured yet. Add your Client ID to GOOGLE_CONFIG in App.js or use Demo Login.");
+              return;
+            }
+            setAuthLoading(true);
+            promptAsync();
+          }}
+          onDemoLogin={handleDemoLogin}
+          loading={authLoading}
+          authError={authError}
+        />
+      </GestureHandlerRootView>
+    );
+  }
+
+  if (authStep === "gender") {
+    return (
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
+        <GenderSelectScreen
+          userName={authData?.user?.name || "Friend"}
+          onSelectGender={handleSelectGender}
+        />
+      </GestureHandlerRootView>
+    );
+  }
+
+  const userGender = authData?.gender || "female";
+  const currentTabs = TABS.filter((t) => {
+    if (t.key === "health" && userGender === "male") return false;
+    return true;
+  });
 
   const openMenu = () => setDrawerOpen(true);
 
@@ -2756,14 +3409,16 @@ export default function App() {
         {tab === "reports" && <ExpenseReportsScreen onMenuPress={openMenu} />}
         {tab === "progress" && <ProgressScreen onMenuPress={openMenu} />}
         {tab === "notes" && <NotesScreen onMenuPress={openMenu} />}
-        {tab === "health" && <HealthScreen onMenuPress={openMenu} />}
+        {tab === "health" && userGender === "female" && <HealthScreen onMenuPress={openMenu} />}
 
         <Drawer
           visible={drawerOpen}
           onClose={() => setDrawerOpen(false)}
-          activeTab={tab}
+          activeTab={tab === "health" && userGender === "male" ? "home" : tab}
           onSelectTab={setTab}
-          tabs={TABS}
+          tabs={currentTabs}
+          userProfile={authData?.user}
+          onSignOut={handleSignOut}
         />
       </View>
     </GestureHandlerRootView>
@@ -3394,4 +4049,210 @@ const s = StyleSheet.create({
   noteBannerContent: { flex: 1, padding: 12, justifyContent: "center" },
   noteBannerTitle: { color: colors.text, fontSize: 15, fontWeight: "700" },
   noteBannerPreview: { color: colors.textMuted, fontSize: 12, marginTop: 4 },
+
+  // Auth & Gender Selection Styles
+  authScreen: {
+    flex: 1,
+    backgroundColor: colors.bg,
+  },
+  authScrollContent: {
+    paddingHorizontal: 24,
+    paddingTop: TOP_INSET + 24,
+    paddingBottom: BOTTOM_INSET + 32,
+    alignItems: "center",
+  },
+  authLogoBox: {
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    backgroundColor: colors.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 2,
+    borderColor: colors.streakOrange,
+    marginBottom: 16,
+    ...cardShadow,
+  },
+  authLogoImage: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+  },
+  authTitle: {
+    color: colors.text,
+    fontSize: 32,
+    fontWeight: "900",
+    letterSpacing: -0.5,
+  },
+  authTagline: {
+    color: colors.textMuted,
+    fontSize: 14,
+    fontWeight: "500",
+    marginTop: 4,
+    marginBottom: 24,
+  },
+  authFeatureCard: {
+    width: "100%",
+    backgroundColor: colors.surface,
+    borderRadius: 18,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginBottom: 20,
+    gap: 16,
+  },
+  authFeatureRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+  },
+  authFeatureTitle: {
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  authFeatureSub: {
+    color: colors.textMuted,
+    fontSize: 12,
+    marginTop: 2,
+    lineHeight: 16,
+  },
+  authErrorBanner: {
+    width: "100%",
+    backgroundColor: "rgba(239, 68, 68, 0.15)",
+    borderWidth: 1,
+    borderColor: colors.negative,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 16,
+  },
+  authErrorText: {
+    color: colors.negative,
+    fontSize: 12,
+    fontWeight: "600",
+    textAlign: "center",
+  },
+  googleBtn: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 12,
+    backgroundColor: colors.text,
+    borderRadius: 14,
+    paddingVertical: 14,
+    ...cardShadow,
+  },
+  googleBtnText: {
+    color: colors.bg,
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  authPrivacyNote: {
+    color: colors.textFaint,
+    fontSize: 11,
+    textAlign: "center",
+    marginTop: 14,
+    lineHeight: 16,
+    paddingHorizontal: 12,
+  },
+  demoBtn: {
+    marginTop: 18,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    backgroundColor: colors.surfaceHighlight,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  demoBtnText: {
+    color: colors.streakOrange,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  genderHeaderBox: {
+    alignItems: "center",
+    marginBottom: 28,
+  },
+  genderGreeting: {
+    color: colors.text,
+    fontSize: 26,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+  genderSub: {
+    color: colors.textMuted,
+    fontSize: 13,
+    textAlign: "center",
+    marginTop: 8,
+    paddingHorizontal: 16,
+    lineHeight: 18,
+  },
+  genderOptionCard: {
+    width: "100%",
+    backgroundColor: colors.surface,
+    borderRadius: 18,
+    padding: 18,
+    borderWidth: 2,
+    borderColor: colors.border,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 16,
+    marginBottom: 16,
+  },
+  genderOptionCardSelected: {
+    borderColor: colors.streakOrange,
+    backgroundColor: colors.surfaceRaised,
+  },
+  genderOptionCardSelectedFemale: {
+    borderColor: colors.periods,
+    backgroundColor: colors.surfaceRaised,
+  },
+  genderOptionEmojiWrap: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: colors.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  genderOptionTitle: {
+    color: colors.text,
+    fontSize: 17,
+    fontWeight: "800",
+  },
+  genderOptionDesc: {
+    color: colors.textMuted,
+    fontSize: 12,
+    marginTop: 4,
+    lineHeight: 16,
+  },
+  genderContinueBtn: {
+    width: "100%",
+    backgroundColor: colors.habitGreen,
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 10,
+    ...cardShadow,
+  },
+  genderContinueBtnText: {
+    color: "#FFF",
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  genderNote: {
+    color: colors.textFaint,
+    fontSize: 11,
+    textAlign: "center",
+    marginTop: 16,
+  },
+  drawerAvatarPlaceholder: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+  },
 });
