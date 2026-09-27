@@ -9,7 +9,8 @@
 //   - REPORTS: Wealth overview visuals + ritual consistency monthly calendars.
 //   - MENU: Home -> Expenses -> Reports -> Progress -> Notes -> Period Tracker.
 //   - NOTES: Collapsible "Buy" checklist section with anime note cards + scattered emojis.
-//   - Ready for Snack Expo Dev (snack.expo.dev) & Expo SDK 51+.
+//   - 📚 IMAGE LIBRARY: Customize any section's artwork from your gallery.
+//   - 🔍 UNIVERSAL ZOOM: Pinch to zoom anywhere, double-tap to reset.
 // ─────────────────────────────────────────────────────────────
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
@@ -36,9 +37,13 @@ import Svg, { Circle } from "react-native-svg";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import * as WebBrowser from "expo-web-browser";
 import * as Google from "expo-auth-session/providers/google";
-import { makeRedirectUri } from "expo-auth-session";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants, { AppOwnership } from "expo-constants";
+
+// Modular imports
+import Drawer from "./src/components/Drawer";
+import ZoomContainer from "./src/components/ZoomContainer";
+import EditableImage from "./src/components/EditableImage";
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -50,20 +55,13 @@ const LOCAL_ASSETS = {
   d: require("./assets/d.png"),
   e: require("./assets/e.png"),
   f: require("./assets/f.png"),
-  food: require("./assets/food.png"),
   hi: require("./assets/hi.png"),
   dolphin: require("./assets/dolphin.png"),
   inosuke: require("./assets/inosuke.png"),
-  sanemi: require("./assets/sanemi.png"),
   jiraiya: require("./assets/jiraiya.png"),
-  shikamaru: require("./assets/shikamaru.jpg"),
   luffy: require("./assets/luffy.png"),
-  luffyAngry: require("./assets/luffy_angry.png"),
   minato: require("./assets/minato.png"),
   naruto: require("./assets/naruto.png"),
-  tanjiro: require("./assets/tanjiro.png"),
-  uzui: require("./assets/uzui.png"),
-  nezuko: require("./assets/nezuko.png"),
   shinobu: require("./assets/shinobu.png"),
   note1: require("./assets/note1.jpg"),
   note2: require("./assets/note2.jpg"),
@@ -800,23 +798,83 @@ async function searchTags(kind, query) {
 }
 async function getOrCreateTag(kind, name) {
   const db = await getDb();
-  const trimmed = name.trim();
   const existing = await db.getFirstAsync(
-    `SELECT id, kind, name, usage_count FROM tags WHERE kind = ? AND name = ? COLLATE NOCASE`,
-    [kind, trimmed]
+    `SELECT id, kind, name, usage_count FROM tags WHERE kind = ? AND LOWER(name) = LOWER(?)`,
+    [kind, name]
   );
   if (existing) return existing;
-  const result = await db.runAsync(`INSERT INTO tags (kind, name, usage_count) VALUES (?, ?, 0)`, [
-    kind,
-    trimmed,
-  ]);
+  const res = await db.runAsync(`INSERT INTO tags (kind, name, usage_count) VALUES (?, ?, 0)`, [kind, name]);
   triggerTableSync("tags");
-  return { id: result.lastInsertRowId, kind, name: trimmed, usage_count: 0 };
+  return { id: res.lastInsertRowId, kind, name, usage_count: 0 };
 }
 async function bumpTagUsage(tagId) {
   const db = await getDb();
   await db.runAsync(`UPDATE tags SET usage_count = usage_count + 1 WHERE id = ?`, [tagId]);
   triggerTableSync("tags");
+}
+
+// ───────────── LEARNING NOTES QUERIES ─────────────
+async function listLearningNotes(date) {
+  const db = await getDb();
+  return db.getAllAsync(`SELECT * FROM learning_notes WHERE date = ? ORDER BY created_at DESC`, [date]);
+}
+async function saveLearningEntry(id, date, body) {
+  const db = await getDb();
+  if (id) {
+    await db.runAsync(`UPDATE learning_notes SET body=?, updated_at=datetime('now') WHERE id=?`, [body, id]);
+  } else {
+    await db.runAsync(`INSERT INTO learning_notes (date, body) VALUES (?,?)`, [date, body]);
+  }
+  triggerTableSync("learning_notes");
+}
+async function deleteLearningEntry(id) {
+  const db = await getDb();
+  await db.runAsync(`DELETE FROM learning_notes WHERE id=?`, [id]);
+  triggerTableSync("learning_notes");
+}
+
+// ───────────── BUY ITEMS QUERIES ─────────────
+async function listBuyItems() {
+  const db = await getDb();
+  return db.getAllAsync(`SELECT * FROM buy_items ORDER BY completed ASC, created_at DESC`);
+}
+async function addBuyItem(title) {
+  const db = await getDb();
+  await db.runAsync(`INSERT INTO buy_items (title) VALUES (?)`, [title]);
+  triggerTableSync("buy_items");
+}
+async function toggleBuyItem(id) {
+  const db = await getDb();
+  await db.runAsync(`UPDATE buy_items SET completed = CASE WHEN completed = 0 THEN 1 ELSE 0 END WHERE id = ?`, [id]);
+  triggerTableSync("buy_items");
+}
+async function deleteBuyItem(id) {
+  const db = await getDb();
+  await db.runAsync(`DELETE FROM buy_items WHERE id = ?`, [id]);
+  triggerTableSync("buy_items");
+}
+
+// ───────────── NOTES QUERIES ─────────────
+async function listNotes() {
+  const db = await getDb();
+  return db.getAllAsync(`SELECT * FROM notes ORDER BY updated_at DESC, id DESC`);
+}
+async function saveNote(note) {
+  const db = await getDb();
+  let resultId = note.id;
+  if (note.id) {
+    await db.runAsync(`UPDATE notes SET title=?, body=?, updated_at=datetime('now') WHERE id=?`, [note.title, note.body, note.id]);
+  } else {
+    const result = await db.runAsync(`INSERT INTO notes (title, body) VALUES (?,?)`, [note.title, note.body]);
+    resultId = result.lastInsertRowId;
+  }
+  triggerTableSync("notes");
+  return resultId;
+}
+async function deleteNote(id) {
+  const db = await getDb();
+  await db.runAsync(`DELETE FROM notes WHERE id=?`, [id]);
+  triggerTableSync("notes");
 }
 
 // ───────────── EXPENSE QUERIES ─────────────
@@ -945,78 +1003,6 @@ async function togglePeriodDay(date) {
   triggerTableSync("period_days");
 }
 
-// ───────────── BUY ITEMS QUERIES ─────────────
-async function listBuyItems() {
-  const db = await getDb();
-  return db.getAllAsync(`SELECT * FROM buy_items ORDER BY completed ASC, id DESC`);
-}
-async function addBuyItem(title) {
-  const db = await getDb();
-  const result = await db.runAsync(`INSERT INTO buy_items (title, completed) VALUES (?, 0)`, [title.trim()]);
-  triggerTableSync("buy_items");
-  return result.lastInsertRowId;
-}
-async function toggleBuyItem(id) {
-  const db = await getDb();
-  const item = await db.getFirstAsync(`SELECT completed FROM buy_items WHERE id=?`, [id]);
-  if (item) {
-    const nextVal = item.completed ? 0 : 1;
-    await db.runAsync(`UPDATE buy_items SET completed=? WHERE id=?`, [nextVal, id]);
-    triggerTableSync("buy_items");
-  }
-}
-async function deleteBuyItem(id) {
-  const db = await getDb();
-  await db.runAsync(`DELETE FROM buy_items WHERE id=?`, [id]);
-  triggerTableSync("buy_items");
-}
-
-// ───────────── DAILY LEARNING NOTES ─────────────
-async function listLearningNotes(date) {
-  const db = await getDb();
-  return db.getAllAsync(`SELECT * FROM learning_notes WHERE date=? ORDER BY id DESC`, [date]);
-}
-async function saveLearningEntry(id, date, body) {
-  const db = await getDb();
-  let resultId = id;
-  if (id) {
-    await db.runAsync(`UPDATE learning_notes SET body=?, updated_at=datetime('now') WHERE id=?`, [body, id]);
-  } else {
-    const result = await db.runAsync(`INSERT INTO learning_notes (date, body) VALUES (?,?)`, [date, body]);
-    resultId = result.lastInsertRowId;
-  }
-  triggerTableSync("learning_notes");
-  return resultId;
-}
-async function deleteLearningEntry(id) {
-  const db = await getDb();
-  await db.runAsync(`DELETE FROM learning_notes WHERE id=?`, [id]);
-  triggerTableSync("learning_notes");
-}
-
-// ───────────── NOTES QUERIES ─────────────
-async function listNotes() {
-  const db = await getDb();
-  return db.getAllAsync(`SELECT * FROM notes ORDER BY updated_at DESC, id DESC`);
-}
-async function saveNote(note) {
-  const db = await getDb();
-  let resultId = note.id;
-  if (note.id) {
-    await db.runAsync(`UPDATE notes SET title=?, body=?, updated_at=datetime('now') WHERE id=?`, [note.title, note.body, note.id]);
-  } else {
-    const result = await db.runAsync(`INSERT INTO notes (title, body) VALUES (?,?)`, [note.title, note.body]);
-    resultId = result.lastInsertRowId;
-  }
-  triggerTableSync("notes");
-  return resultId;
-}
-async function deleteNote(id) {
-  const db = await getDb();
-  await db.runAsync(`DELETE FROM notes WHERE id=?`, [id]);
-  triggerTableSync("notes");
-}
-
 // ───────────── HEADER & MENU BUTTON ─────────────
 function ScreenHeader({ title, onMenuPress, iconKey }) {
   return (
@@ -1036,114 +1022,6 @@ function ScreenHeader({ title, onMenuPress, iconKey }) {
       )}
       <Text style={s.headerTitleText}>{title}</Text>
     </View>
-  );
-}
-
-// ───────────── DRAWER NAVIGATION ─────────────
-function Drawer({ visible, onClose, activeTab, onSelectTab, tabs, userProfile, onSignOut }) {
-  const translateX = useRef(new Animated.Value(-320)).current;
-  const backdropOpacity = useRef(new Animated.Value(0)).current;
-  const [modalVisible, setModalVisible] = useState(false);
-
-  useEffect(() => {
-    if (visible) {
-      translateX.setValue(-320);
-      backdropOpacity.setValue(0);
-      setModalVisible(true);
-    } else {
-      Animated.parallel([
-        Animated.timing(translateX, { toValue: -320, duration: 200, useNativeDriver: true }),
-        Animated.timing(backdropOpacity, { toValue: 0, duration: 200, useNativeDriver: true }),
-      ]).start(() => setModalVisible(false));
-    }
-  }, [visible]);
-
-  function handleShow() {
-    Animated.parallel([
-      Animated.timing(translateX, { toValue: 0, duration: 260, useNativeDriver: true }),
-      Animated.timing(backdropOpacity, { toValue: 1, duration: 260, useNativeDriver: true }),
-    ]).start();
-  }
-
-  return (
-    <Modal
-      visible={modalVisible}
-      transparent
-      animationType="none"
-      onShow={handleShow}
-      onRequestClose={onClose}
-      statusBarTranslucent
-    >
-      <GestureHandlerRootView style={{ flex: 1 }}>
-        <Animated.View
-          style={[StyleSheet.absoluteFill, { backgroundColor: "rgba(0,0,0,0.6)", opacity: backdropOpacity }]}
-          pointerEvents="box-none"
-        >
-          <TouchableOpacity
-            style={StyleSheet.absoluteFill}
-            onPress={onClose}
-            activeOpacity={1}
-          />
-        </Animated.View>
-
-        <Animated.View style={[s.drawer, { transform: [{ translateX }] }]}>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
-            <Image source={LOCAL_ASSETS.winnie} style={s.drawerAvatar} />
-            <Text style={s.drawerBrand}>Winnie 🐾</Text>
-          </View>
-
-          <View style={{ marginTop: 32, gap: 6 }}>
-            {tabs.map((t) => {
-              const active = activeTab === t.key;
-              return (
-                <TouchableOpacity
-                  key={t.key}
-                  onPress={() => {
-                    onSelectTab(t.key);
-                    onClose();
-                  }}
-                  style={[s.drawerItem, active && { backgroundColor: colors.surface }]}
-                  activeOpacity={0.7}
-                >
-                  <View style={[s.dot, { backgroundColor: active ? t.accent : "transparent", borderColor: t.accent }]} />
-                  <Text style={[s.drawerItemText, active && { color: colors.text, fontWeight: "600" }]}>{t.label}</Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-
-          {userProfile && (
-            <View style={{ marginTop: "auto", marginBottom: BOTTOM_INSET + 10, paddingTop: 16, borderTopWidth: 1, borderTopColor: colors.border }}>
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 6, marginBottom: 12 }}>
-                <View style={[s.drawerAvatarPlaceholder, { backgroundColor: colors.surfaceHighlight }]}>
-                  <Text style={{ color: colors.text, fontWeight: "700", fontSize: 14 }}>
-                    {(userProfile.name || userProfile.email || "W")[0].toUpperCase()}
-                  </Text>
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={{ color: colors.text, fontSize: 13, fontWeight: "700" }} numberOfLines={1}>
-                    {userProfile.name || "Explorer"}
-                  </Text>
-                  <Text style={{ color: colors.textFaint, fontSize: 11 }} numberOfLines={1}>
-                    {userProfile.email || ""}
-                  </Text>
-                </View>
-              </View>
-              <TouchableOpacity
-                onPress={() => {
-                  onClose();
-                  if (onSignOut) onSignOut();
-                }}
-                style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 10, backgroundColor: "rgba(239, 68, 68, 0.12)" }}
-                activeOpacity={0.7}
-              >
-                <Text style={{ color: colors.negative, fontSize: 13, fontWeight: "700" }}>Sign Out 🚪</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-        </Animated.View>
-      </GestureHandlerRootView>
-    </Modal>
   );
 }
 
@@ -1640,7 +1518,12 @@ function HomeScreen({ onMenuPress, onRitualTapped }) {
       <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 30 }}>
         {/* HERO BANNER WITH CHARACTER IMAGE */}
         <View style={s.bannerCard}>
-          <Image source={LOCAL_ASSETS.hi} style={s.bannerImage} />
+          <EditableImage
+            imageKey="banner_home"
+            defaultSource={LOCAL_ASSETS.hi}
+            style={s.bannerImage}
+            resizeMode="contain"
+          />
           <View style={s.bannerOverlay}>
             <Text style={s.bannerTitle}>Welcome Back, Champ! ⚡</Text>
             <Text style={s.bannerSub}>Let's smash today's goals with Winnie 🐾</Text>
@@ -1797,7 +1680,12 @@ function ProgressScreen({ onMenuPress }) {
         <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 }}>
           {/* MOTIVATION ART BANNER */}
           <View style={s.bannerCard}>
-            <Image source={LOCAL_ASSETS.inosuke} style={s.bannerImage} />
+            <EditableImage
+              imageKey="banner_progress"
+              defaultSource={LOCAL_ASSETS.inosuke}
+              style={s.bannerImage}
+              resizeMode="contain"
+            />
             <View style={s.bannerOverlay}>
               <Text style={s.bannerTitle}>Never Give Up! 🔥</Text>
               <Text style={s.bannerSub}>Push past your limits and build unwavering consistency ⭐</Text>
@@ -2040,7 +1928,12 @@ function HealthScreen({ onMenuPress }) {
       <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 }}>
         {/* BANNER ART FOR PERIOD TRACKER */}
         <View style={s.bannerCard}>
-          <Image source={LOCAL_ASSETS.shinobu} style={s.bannerImage} />
+          <EditableImage
+            imageKey="banner_health"
+            defaultSource={LOCAL_ASSETS.shinobu}
+            style={s.bannerImage}
+            resizeMode="contain"
+          />
           <View style={s.bannerOverlay}>
             <Text style={s.bannerTitle}>Self Care First 💖</Text>
             <Text style={s.bannerSub}>Monitor your cycle with comfort & balance 🌸</Text>
@@ -2326,7 +2219,8 @@ function EntryCard({ entry, onDeleted, onEdit, interactive = true, showDate = fa
   const [breakdown, setBreakdown] = useState(null);
   const isIncome = entry.type === "income";
   const hasBreakdown = entry.breakdown_count > 0;
-  const expenseImage = EXPENSE_IMAGES[(entry.id || 0) % EXPENSE_IMAGES.length];
+  const expenseIndex = (entry.id || 0) % EXPENSE_IMAGES.length;
+  const expenseImage = EXPENSE_IMAGES[expenseIndex];
 
   async function toggleExpand() {
     if (!hasBreakdown) return;
@@ -2368,7 +2262,12 @@ function EntryCard({ entry, onDeleted, onEdit, interactive = true, showDate = fa
   const cardContent = (
     <View style={s.entryCard}>
       <Pressable onPress={toggleExpand} onLongPress={handleLongPress} style={s.entryRow}>
-        <Image source={expenseImage} style={s.entryCardThumb} />
+        <EditableImage
+          imageKey={`expense_thumb_${expenseIndex}`}
+          defaultSource={expenseImage}
+          style={s.entryCardThumb}
+          resizeMode="cover"
+        />
         <View style={s.entryLeft}>
           <View style={[s.dotSolid, { backgroundColor: isIncome ? colors.positive : colors.expense }]} />
           <View style={{ flexShrink: 1 }}>
@@ -2458,7 +2357,12 @@ function ExpensesScreen({ focusKey, onMenuPress }) {
           <View>
             {/* HERO BANNER FOR EXPENSES */}
             <View style={s.bannerCard}>
-              <Image source={LOCAL_ASSETS.luffy} style={s.bannerImage} />
+              <EditableImage
+                imageKey="banner_expenses"
+                defaultSource={LOCAL_ASSETS.luffy}
+                style={s.bannerImage}
+                resizeMode="contain"
+              />
               <View style={s.bannerOverlay}>
                 <Text style={s.bannerTitle}>Smart Spending 💵</Text>
                 <Text style={s.bannerSub}>Keep your treasure safe and budget like a king 🏴‍☠️</Text>
@@ -2695,7 +2599,12 @@ function ExpenseReportsScreen({ onMenuPress }) {
       <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 30 }}>
         {/* HERO BANNER FOR REPORTS */}
         <View style={s.bannerCard}>
-          <Image source={LOCAL_ASSETS.minato} style={s.bannerImage} />
+          <EditableImage
+            imageKey="banner_reports"
+            defaultSource={LOCAL_ASSETS.minato}
+            style={s.bannerImage}
+            resizeMode="contain"
+          />
           <View style={s.bannerOverlay}>
             <Text style={s.bannerTitle}>Financial Mastery 📈</Text>
             <Text style={s.bannerSub}>Analyze your cashflow with flash precision ⚡</Text>
@@ -2744,8 +2653,6 @@ function ExpenseReportsScreen({ onMenuPress }) {
             </View>
           </View>
         </View>
-
-        
 
         {loading ? (
           <Text style={s.emptyText}>Loading report… ⏳</Text>
@@ -2801,12 +2708,12 @@ function ExpenseReportsScreen({ onMenuPress }) {
             <View style={[s.reportCard, cardShadow]}>
               <DonutChart rows={rows} colorsForRows={chartColors} />
             </View>
-        {/* RITUAL CONSISTENCY REPORT SECTION */}
-        <Text style={s.listLabel}>Ritual Consistency Reports 🗓️</Text>
-        {rituals.map((r) => (
-          <RitualReportCalendar key={r.id} ritual={r} monthDate={month} onToggleDay={load} />
-        ))}
 
+            {/* RITUAL CONSISTENCY REPORT SECTION */}
+            <Text style={s.listLabel}>Ritual Consistency Reports 🗓️</Text>
+            {rituals.map((r) => (
+              <RitualReportCalendar key={r.id} ritual={r} monthDate={month} onToggleDay={load} />
+            ))}
           </>
         )}
       </ScrollView>
@@ -2879,26 +2786,30 @@ function BuySection() {
           </View>
 
           {items.map((item) => (
-            <View key={item.id} style={s.buyItemRow}>
-              <Text
-                style={[
-                  s.buyItemText,
-                  item.completed && s.buyItemTextCompleted,
-                ]}
-              >
-                {item.title}
-              </Text>
-              <Pressable
-                onPress={() => handleToggle(item.id)}
-                onLongPress={() => handleDelete(item.id)}
-                style={[
-                  s.buyCheckbox,
-                  item.completed && s.buyCheckboxCompleted,
-                ]}
-              >
-                {item.completed ? <Text style={s.buyCheckmark}>✓</Text> : null}
-              </Pressable>
-            </View>
+            <SwipeableRow
+              key={item.id}
+              onSwipeDelete={() => handleDelete(item.id)}
+            >
+              <View style={s.buyItemRow}>
+                <Text
+                  style={[
+                    s.buyItemText,
+                    item.completed && s.buyItemTextCompleted,
+                  ]}
+                >
+                  {item.title}
+                </Text>
+                <Pressable
+                  onPress={() => handleToggle(item.id)}
+                  style={[
+                    s.buyCheckbox,
+                    item.completed && s.buyCheckboxCompleted,
+                  ]}
+                >
+                  {item.completed ? <Text style={s.buyCheckmark}>✓</Text> : null}
+                </Pressable>
+              </View>
+            </SwipeableRow>
           ))}
         </View>
       )}
@@ -2973,7 +2884,12 @@ function NotesScreen({ onMenuPress }) {
           <View style={{ paddingTop: 10 }}>
             {/* HERO BANNER FOR NOTES */}
             <View style={s.bannerCard}>
-              <Image source={LOCAL_ASSETS.naruto} style={s.bannerImage} />
+              <EditableImage
+                imageKey="banner_notes"
+                defaultSource={LOCAL_ASSETS.naruto}
+                style={s.bannerImage}
+                resizeMode="contain"
+              />
               <View style={s.bannerOverlay}>
                 <Text style={s.bannerTitle}>Ninja Scrolls 📜</Text>
                 <Text style={s.bannerSub}>Capture your grand thoughts & secret plans ✨</Text>
@@ -2988,7 +2904,8 @@ function NotesScreen({ onMenuPress }) {
         }
         renderItem={({ item, index }) => {
           const preview = (item.body || "").split("\n")[0].trim();
-          const noteImage = NOTE_IMAGES[index % NOTE_IMAGES.length];
+          const noteIndex = index % NOTE_IMAGES.length;
+          const noteImage = NOTE_IMAGES[noteIndex];
           return (
             <Pressable
               onPress={() => {
@@ -3010,7 +2927,12 @@ function NotesScreen({ onMenuPress }) {
               }}
               style={s.noteBannerCard}
             >
-              <Image source={noteImage} style={s.noteBannerImage} />
+              <EditableImage
+                imageKey={`note_thumb_${noteIndex}`}
+                defaultSource={noteImage}
+                style={s.noteBannerImage}
+                resizeMode="cover"
+              />
               <View style={s.noteBannerContent}>
                 <Text style={s.noteBannerTitle} numberOfLines={1}>
                   {item.title || "Untitled note"}
@@ -3059,7 +2981,12 @@ function LoginScreen({ onGoogleLogin, onDemoLogin, loading, authError }) {
     <View style={s.authScreen}>
       <ScrollView contentContainerStyle={s.authScrollContent} showsVerticalScrollIndicator={false}>
         <View style={s.authLogoBox}>
-          <Image source={LOCAL_ASSETS.winnie} style={s.authLogoImage} />
+          <EditableImage
+            imageKey="logo_winnie"
+            defaultSource={LOCAL_ASSETS.winnie}
+            style={s.authLogoImage}
+            resizeMode="cover"
+          />
         </View>
 
         <Text style={s.authTitle}>Winnie 🐾</Text>
@@ -3203,6 +3130,7 @@ function GenderSelectScreen({ userName, onSelectGender }) {
   );
 }
 
+// ───────────── ROOT APP ─────────────
 export default function App() {
   const [ready, setReady] = useState(false);
   const [authStep, setAuthStep] = useState("loading"); // "loading" | "login" | "gender" | "main"
@@ -3220,7 +3148,6 @@ export default function App() {
   const [request, response, promptAsync] = Google.useAuthRequest({
     clientId: GOOGLE_CONFIG.webClientId,
     webClientId: GOOGLE_CONFIG.webClientId,
-    // Native client IDs only work in standalone APK / IPA where package name matches:
     androidClientId: isExpoGo ? undefined : GOOGLE_CONFIG.androidClientId,
     iosClientId: isExpoGo ? undefined : GOOGLE_CONFIG.iosClientId,
     scopes: [
@@ -3230,6 +3157,7 @@ export default function App() {
       "https://www.googleapis.com/auth/spreadsheets",
       "https://www.googleapis.com/auth/drive.file",
     ],
+    selectAccount: true,
   });
 
   useEffect(() => {
@@ -3402,25 +3330,27 @@ export default function App() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <View style={s.screen}>
-        <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
-        {tab === "home" && <HomeScreen onMenuPress={openMenu} />}
-        {tab === "expenses" && <ExpensesScreen focusKey={tab} onMenuPress={openMenu} />}
-        {tab === "reports" && <ExpenseReportsScreen onMenuPress={openMenu} />}
-        {tab === "progress" && <ProgressScreen onMenuPress={openMenu} />}
-        {tab === "notes" && <NotesScreen onMenuPress={openMenu} />}
-        {tab === "health" && userGender === "female" && <HealthScreen onMenuPress={openMenu} />}
+      <ZoomContainer>
+        <View style={s.screen}>
+          <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
+          {tab === "home" && <HomeScreen onMenuPress={openMenu} />}
+          {tab === "expenses" && <ExpensesScreen focusKey={tab} onMenuPress={openMenu} />}
+          {tab === "reports" && <ExpenseReportsScreen onMenuPress={openMenu} />}
+          {tab === "progress" && <ProgressScreen onMenuPress={openMenu} />}
+          {tab === "notes" && <NotesScreen onMenuPress={openMenu} />}
+          {tab === "health" && userGender === "female" && <HealthScreen onMenuPress={openMenu} />}
 
-        <Drawer
-          visible={drawerOpen}
-          onClose={() => setDrawerOpen(false)}
-          activeTab={tab === "health" && userGender === "male" ? "home" : tab}
-          onSelectTab={setTab}
-          tabs={currentTabs}
-          userProfile={authData?.user}
-          onSignOut={handleSignOut}
-        />
-      </View>
+          <Drawer
+            visible={drawerOpen}
+            onClose={() => setDrawerOpen(false)}
+            activeTab={tab === "health" && userGender === "male" ? "home" : tab}
+            onSelectTab={setTab}
+            tabs={currentTabs}
+            userProfile={authData?.user}
+            onSignOut={handleSignOut}
+          />
+        </View>
+      </ZoomContainer>
     </GestureHandlerRootView>
   );
 }

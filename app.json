@@ -6,7 +6,7 @@
     "orientation": "portrait",
     "icon": "./assets/android-icon-foreground.png",
     "userInterfaceStyle": "light",
-    "scheme": "winnie",
+    "scheme": ["winnie", "com.preeth.winnie"],
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.preeth.winnie"
