@@ -92,6 +92,7 @@ const EXPENSE_IMAGES = [
 // ───────────── ASSET / ICON MAP ─────────────
 const APP_ICONS = {
   home: { uri: "https://img.icons8.com/color/48/home--v1.png" },
+  tasks: { uri: "https://img.icons8.com/color/48/task--v1.png" },
   expenses: { uri: "https://img.icons8.com/color/48/wallet--v1.png" },
   reports: { uri: "https://img.icons8.com/color/48/analytics.png" },
   progress: { uri: "https://img.icons8.com/color/48/fire-element.png" },
@@ -99,6 +100,7 @@ const APP_ICONS = {
   health: { uri: "https://img.icons8.com/color/48/like--v1.png" },
   empty: { uri: "https://img.icons8.com/color/48/box--v1.png" },
   buy: { uri: "https://img.icons8.com/color/48/shopping-cart--v1.png" },
+  calendar: { uri: "https://img.icons8.com/color/48/google-calendar--v2.png" },
 };
 
 // ───────────── THEME & PALETTE ─────────────
@@ -129,6 +131,7 @@ const colors = {
 
 const TOP_INSET = Platform.OS === "android" ? StatusBar.currentHeight || 26 : 48;
 const BOTTOM_INSET = 28;
+const TAB_BAR_HEIGHT = 62;
 
 const cardShadow = {
   shadowColor: "#000",
@@ -303,7 +306,8 @@ const TABLE_COLUMNS = {
   period_days: ["date"],
   learning_notes: ["id", "date", "body", "created_at", "updated_at"],
   notes: ["id", "title", "body", "created_at", "updated_at"],
-  buy_items: ["id", "title", "completed", "created_at"],
+  buy_items: ["id", "title", "completed", "price_min", "price_max", "sort_order", "created_at"],
+  tasks: ["id", "title", "description", "due_date", "due_time", "priority", "category", "repeat", "completed", "google_event_id", "created_at"],
 };
 
 export async function createOrFindSpreadsheet(token) {
@@ -572,9 +576,31 @@ async function initDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       title TEXT NOT NULL,
       completed INTEGER NOT NULL DEFAULT 0,
+      price_min REAL DEFAULT 0,
+      price_max REAL DEFAULT 0,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      due_date TEXT NOT NULL,
+      due_time TEXT DEFAULT '09:00',
+      priority TEXT NOT NULL DEFAULT 'medium',
+      category TEXT NOT NULL DEFAULT 'General',
+      repeat TEXT NOT NULL DEFAULT 'none',
+      completed INTEGER NOT NULL DEFAULT 0,
+      google_event_id TEXT DEFAULT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  await db.runAsync(`ALTER TABLE buy_items ADD COLUMN price_min REAL DEFAULT 0`).catch(() => {});
+  await db.runAsync(`ALTER TABLE buy_items ADD COLUMN price_max REAL DEFAULT 0`).catch(() => {});
+  await db.runAsync(`ALTER TABLE buy_items ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`).catch(() => {});
+  await db.runAsync(`ALTER TABLE tasks ADD COLUMN google_event_id TEXT DEFAULT NULL`).catch(() => {});
 
   const countRow = await db.getFirstAsync(`SELECT COUNT(*) as count FROM rituals`);
   if (!countRow || countRow.count === 0) {
@@ -588,14 +614,13 @@ async function initDatabase() {
   }
 
   const starterTags = [
-    ["expense", "Food & Drinks"],
+    ["expense", "Food"],
     ["expense", "Transport"],
     ["expense", "Groceries"],
     ["expense", "Shopping"],
     ["expense", "Bills"],
     ["expense", "Health"],
     ["income", "Salary"],
-    ["income", "Freelance"],
     ["income", "Investments"],
     ["income", "Gift"],
   ];
@@ -836,11 +861,30 @@ async function deleteLearningEntry(id) {
 // ───────────── BUY ITEMS QUERIES ─────────────
 async function listBuyItems() {
   const db = await getDb();
-  return db.getAllAsync(`SELECT * FROM buy_items ORDER BY completed ASC, created_at DESC`);
+  return db.getAllAsync(`SELECT * FROM buy_items ORDER BY completed ASC, sort_order ASC, id ASC`);
 }
-async function addBuyItem(title) {
+async function addBuyItem(title, priceMin = 0, priceMax = 0) {
   const db = await getDb();
-  await db.runAsync(`INSERT INTO buy_items (title) VALUES (?)`, [title]);
+  const maxRow = await db.getFirstAsync(`SELECT MAX(sort_order) as maxOrder FROM buy_items`);
+  const sort_order = (maxRow?.maxOrder || 0) + 1;
+  const res = await db.runAsync(
+    `INSERT INTO buy_items (title, completed, price_min, price_max, sort_order) VALUES (?, 0, ?, ?, ?)`,
+    [title.trim(), Number(priceMin) || 0, Number(priceMax) || 0, sort_order]
+  );
+  triggerTableSync("buy_items");
+  return res.lastInsertRowId;
+}
+async function swapBuyItemsOrder(itemA, itemB) {
+  const db = await getDb();
+  const orderA = itemA.sort_order ?? 0;
+  const orderB = itemB.sort_order ?? 0;
+  await db.runAsync(`UPDATE buy_items SET sort_order = ? WHERE id = ?`, [orderB, itemA.id]);
+  await db.runAsync(`UPDATE buy_items SET sort_order = ? WHERE id = ?`, [orderA, itemB.id]);
+  triggerTableSync("buy_items");
+}
+async function updateBuyItemOrder(id, newOrder) {
+  const db = await getDb();
+  await db.runAsync(`UPDATE buy_items SET sort_order = ? WHERE id = ?`, [newOrder, id]);
   triggerTableSync("buy_items");
 }
 async function toggleBuyItem(id) {
@@ -852,6 +896,155 @@ async function deleteBuyItem(id) {
   const db = await getDb();
   await db.runAsync(`DELETE FROM buy_items WHERE id = ?`, [id]);
   triggerTableSync("buy_items");
+}
+async function getTotalAccountBalance() {
+  const db = await getDb();
+  const row = await db.getFirstAsync(
+    `SELECT SUM(CASE WHEN type = 'income' THEN amount ELSE -amount END) as total FROM expenses`
+  );
+  return row?.total ?? 0;
+}
+
+// ───────────── GOOGLE CALENDAR API HELPERS ─────────────
+export async function syncTaskToGoogleCalendar(token, task) {
+  if (!token || token === "demo-token") return null;
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const dateStr = task.due_date || todayISO();
+    const timeStr = task.due_time || "09:00";
+    const startDateTime = new Date(`${dateStr}T${timeStr}:00`);
+    const endDateTime = new Date(startDateTime.getTime() + 30 * 60 * 1000);
+
+    const body = {
+      summary: task.title,
+      description: `${task.description ? task.description + "\n\n" : ""}Winnie App Reminder · Category: ${task.category || "General"} · Priority: ${task.priority || "medium"}`,
+      start: {
+        dateTime: startDateTime.toISOString(),
+        timeZone: tz,
+      },
+      end: {
+        dateTime: endDateTime.toISOString(),
+        timeZone: tz,
+      },
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: "popup", minutes: 15 }, // 15 min before
+          { method: "popup", minutes: 0 },  // at due time
+        ],
+      },
+    };
+
+    if (task.repeat === "daily") {
+      body.recurrence = ["RRULE:FREQ=DAILY"];
+    } else if (task.repeat === "weekly") {
+      body.recurrence = ["RRULE:FREQ=WEEKLY"];
+    }
+
+    let url = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
+    let method = "POST";
+    if (task.google_event_id) {
+      url += `/${encodeURIComponent(task.google_event_id)}`;
+      method = "PATCH";
+    }
+
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      return data.id;
+    } else {
+      console.log("[Calendar] Error syncing task to calendar:", res.status);
+      return null;
+    }
+  } catch (err) {
+    console.log("[Calendar] Exception syncing task:", err);
+    return null;
+  }
+}
+
+export async function deleteGoogleCalendarEvent(token, eventId) {
+  if (!token || !eventId || token === "demo-token") return;
+  try {
+    await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (err) {
+    console.log("[Calendar] Exception deleting event:", err);
+  }
+}
+
+// ───────────── TASKS QUERIES ─────────────
+async function listTasks() {
+  const db = await getDb();
+  return db.getAllAsync(`SELECT * FROM tasks ORDER BY completed ASC, due_date ASC, due_time ASC, id ASC`);
+}
+
+async function addTask({ title, description = "", dueDate = todayISO(), dueTime = "09:00", priority = "medium", category = "General", repeat = "none" }) {
+  const db = await getDb();
+  let googleEventId = null;
+  if (activeToken) {
+    googleEventId = await syncTaskToGoogleCalendar(activeToken, {
+      title,
+      description,
+      due_date: dueDate,
+      due_time: dueTime,
+      priority,
+      category,
+      repeat,
+    });
+  }
+  const res = await db.runAsync(
+    `INSERT INTO tasks (title, description, due_date, due_time, priority, category, repeat, completed, google_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+    [title.trim(), description.trim(), dueDate, dueTime, priority, category, repeat, googleEventId]
+  );
+  triggerTableSync("tasks");
+  return res.lastInsertRowId;
+}
+
+async function updateTask(id, { title, description, dueDate, dueTime, priority, category, repeat, googleEventId }) {
+  const db = await getDb();
+  let newGoogleId = googleEventId;
+  if (activeToken) {
+    newGoogleId = await syncTaskToGoogleCalendar(activeToken, {
+      title,
+      description,
+      due_date: dueDate,
+      due_time: dueTime,
+      priority,
+      category,
+      repeat,
+      google_event_id: googleEventId,
+    });
+  }
+  await db.runAsync(
+    `UPDATE tasks SET title = ?, description = ?, due_date = ?, due_time = ?, priority = ?, category = ?, repeat = ?, google_event_id = ? WHERE id = ?`,
+    [title.trim(), description.trim(), dueDate, dueTime, priority, category, repeat, newGoogleId || googleEventId, id]
+  );
+  triggerTableSync("tasks");
+}
+
+async function toggleTask(id) {
+  const db = await getDb();
+  await db.runAsync(`UPDATE tasks SET completed = CASE WHEN completed = 0 THEN 1 ELSE 0 END WHERE id = ?`, [id]);
+  triggerTableSync("tasks");
+}
+
+async function deleteTask(id, googleEventId) {
+  const db = await getDb();
+  if (googleEventId && activeToken) {
+    deleteGoogleCalendarEvent(activeToken, googleEventId).catch(() => {});
+  }
+  await db.runAsync(`DELETE FROM tasks WHERE id = ?`, [id]);
+  triggerTableSync("tasks");
 }
 
 // ───────────── NOTES QUERIES ─────────────
@@ -1003,8 +1196,18 @@ async function togglePeriodDay(date) {
   triggerTableSync("period_days");
 }
 
+// ───────────── GLOBAL APP CONTEXT ─────────────
+const AppContext = React.createContext({
+  openProfile: () => {},
+  userProfile: null,
+});
+
 // ───────────── HEADER & MENU BUTTON ─────────────
-function ScreenHeader({ title, onMenuPress, iconKey }) {
+function ScreenHeader({ title, onMenuPress, iconKey, onProfilePress, userProfile }) {
+  const ctx = React.useContext(AppContext);
+  const handleProfilePress = onProfilePress || ctx.openProfile;
+  const profile = userProfile || ctx.userProfile;
+
   return (
     <View style={s.headerContainer}>
       <TouchableOpacity
@@ -1017,10 +1220,28 @@ function ScreenHeader({ title, onMenuPress, iconKey }) {
         <View style={s.menuLine} />
         <View style={s.menuLine} />
       </TouchableOpacity>
-      {iconKey && APP_ICONS[iconKey] && (
-        <Image source={APP_ICONS[iconKey]} style={s.headerIcon} />
-      )}
-      <Text style={s.headerTitleText}>{title}</Text>
+      <View style={{ flex: 1, flexDirection: "row", alignItems: "center" }}>
+        {iconKey && APP_ICONS[iconKey] && (
+          <Image source={APP_ICONS[iconKey]} style={s.headerIcon} />
+        )}
+        <Text style={s.headerTitleText} numberOfLines={1}>{title}</Text>
+      </View>
+      <TouchableOpacity
+        onPress={handleProfilePress}
+        style={s.profileHeaderBtn}
+        hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+        activeOpacity={0.7}
+      >
+        {profile?.picture ? (
+          <Image source={{ uri: profile.picture }} style={s.profileHeaderAvatar} />
+        ) : (
+          <View style={s.profileHeaderPlaceholder}>
+            <Text style={s.profileHeaderInitial}>
+              {(profile?.name || "W")[0].toUpperCase()}
+            </Text>
+          </View>
+        )}
+      </TouchableOpacity>
     </View>
   );
 }
@@ -1515,7 +1736,7 @@ function HomeScreen({ onMenuPress, onRitualTapped }) {
   return (
     <View style={s.screen}>
       <ScreenHeader title={getGreeting()} onMenuPress={onMenuPress} iconKey="home" />
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 30 }}>
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 30 + TAB_BAR_HEIGHT }}>
         {/* HERO BANNER WITH CHARACTER IMAGE */}
         <View style={s.bannerCard}>
           <EditableImage
@@ -1677,7 +1898,7 @@ function ProgressScreen({ onMenuPress }) {
         behavior={Platform.OS === "ios" ? "padding" : "height"}
         keyboardVerticalOffset={Platform.OS === "ios" ? 10 : 0}
       >
-        <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 }}>
+        <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 + TAB_BAR_HEIGHT }}>
           {/* MOTIVATION ART BANNER */}
           <View style={s.bannerCard}>
             <EditableImage
@@ -1925,7 +2146,7 @@ function HealthScreen({ onMenuPress }) {
   return (
     <View style={s.screen}>
       <ScreenHeader title="Period Tracker" onMenuPress={onMenuPress} iconKey="health" />
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 }}>
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 + TAB_BAR_HEIGHT }}>
         {/* BANNER ART FOR PERIOD TRACKER */}
         <View style={s.bannerCard}>
           <EditableImage
@@ -2090,10 +2311,14 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : "height"}
         style={s.sheetWrap}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 20 : 0}
+        pointerEvents="box-none"
       >
         <ScrollView
           contentContainerStyle={{ flexGrow: 1, justifyContent: "flex-end" }}
           keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          bounces={false}
         >
           <View style={s.sheetCompact}>
             <View style={s.grabber} />
@@ -2352,7 +2577,7 @@ function ExpensesScreen({ focusKey, onMenuPress }) {
         data={entries}
         keyExtractor={(item) => String(item.id)}
         renderItem={({ item }) => <EntryCard entry={item} onDeleted={load} onEdit={handleEditRequest} />}
-        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 90 }}
+        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 90 + TAB_BAR_HEIGHT }}
         ListHeaderComponent={
           <View>
             {/* HERO BANNER FOR EXPENSES */}
@@ -2414,7 +2639,7 @@ function ExpensesScreen({ focusKey, onMenuPress }) {
         }
       />
 
-      <Pressable style={[s.fab, cardShadow]} onPress={handleAddNew}>
+      <Pressable style={[s.fab, cardShadow, { bottom: BOTTOM_INSET + 20 + TAB_BAR_HEIGHT }]} onPress={handleAddNew}>
         <Text style={s.fabText}>+</Text>
       </Pressable>
 
@@ -2568,7 +2793,52 @@ function ExpenseReportsScreen({ onMenuPress }) {
   const [rituals, setRituals] = useState([]);
   const [summary, setSummary] = useState({ income: 0, expense: 0 });
   const [loading, setLoading] = useState(true);
-  const chartColors = [colors.expense, colors.habitGreen, colors.notes, colors.reminders, colors.periods, colors.streakOrange];
+  const chartColors = [
+    "#6366F1", // Indigo
+    "#10B981", // Emerald
+    "#F59E0B", // Amber
+    "#EC4899", // Pink
+    "#06B6D4", // Cyan
+    "#8B5CF6", // Purple
+    "#F97316", // Orange
+    "#14B8A6", // Teal
+    "#3B82F6", // Blue
+    "#E11D48", // Crimson
+  ];
+
+  const spinAnim = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    if (loading) {
+      const spinLoop = Animated.loop(
+        Animated.timing(spinAnim, {
+          toValue: 1,
+          duration: 1200,
+          useNativeDriver: true,
+        })
+      );
+      const pulseLoop = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 1.15, duration: 600, useNativeDriver: true }),
+          Animated.timing(pulseAnim, { toValue: 0.95, duration: 600, useNativeDriver: true }),
+        ])
+      );
+      spinLoop.start();
+      pulseLoop.start();
+      return () => {
+        spinLoop.stop();
+        pulseLoop.stop();
+        spinAnim.setValue(0);
+        pulseAnim.setValue(1);
+      };
+    }
+  }, [loading]);
+
+  const spin = spinAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ["0deg", "360deg"],
+  });
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -2596,7 +2866,7 @@ function ExpenseReportsScreen({ onMenuPress }) {
   return (
     <View style={s.screen}>
       <ScreenHeader title="Reports" onMenuPress={onMenuPress} iconKey="reports" />
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 30 }}>
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 30 + TAB_BAR_HEIGHT }}>
         {/* HERO BANNER FOR REPORTS */}
         <View style={s.bannerCard}>
           <EditableImage
@@ -2641,7 +2911,7 @@ function ExpenseReportsScreen({ onMenuPress }) {
               </Text>
             </View>
             <View style={[s.reportMetricCol, { alignItems: "flex-end" }]}>
-              <Text style={s.balanceLabel}>Net Savings 🏦</Text>
+              <Text style={s.balanceLabel}>Net Balance 🏦</Text>
               <Text
                 style={[
                   s.reportMetricValue,
@@ -2655,7 +2925,13 @@ function ExpenseReportsScreen({ onMenuPress }) {
         </View>
 
         {loading ? (
-          <Text style={s.emptyText}>Loading report… ⏳</Text>
+          <View style={s.reportLoadingContainer}>
+            <Animated.View style={[s.reportLoadingIconWrap, { transform: [{ rotate: spin }, { scale: pulseAnim }] }]}>
+              <Text style={{ fontSize: 38 }}>📊</Text>
+            </Animated.View>
+            <Text style={s.reportLoadingTitle}>Summoning your financial insights... ✨</Text>
+            <Text style={s.reportLoadingSub}>Crunching numbers & baking your charts 🥧</Text>
+          </View>
         ) : rows.length === 0 ? (
           <View style={s.emptyStateContainer}>
             <Image source={APP_ICONS.empty} style={s.emptyIcon} />
@@ -2663,23 +2939,7 @@ function ExpenseReportsScreen({ onMenuPress }) {
           </View>
         ) : (
           <>
-            <Text style={s.listLabel}>By Category 🏷️</Text>
-            <View style={[s.reportCard, cardShadow]}>
-              {rows.map((row, index) => {
-                const pct = summary.expense ? Math.round((row.total / summary.expense) * 100) : 0;
-                return (
-                  <View key={row.category} style={s.reportRow}>
-                    <View style={s.reportRowLabel}>
-                      <View style={[s.dotSolid, { backgroundColor: chartColors[index % chartColors.length] }]} />
-                      <Text style={s.entryTitle}>{row.category}</Text>
-                    </View>
-                    <Text style={s.reportCategoryText}>
-                      ₹{row.total.toFixed(0)} · {pct}%
-                    </Text>
-                  </View>
-                );
-              })}
-            </View>
+            
 
             <Text style={s.listLabel}>Spending Bars 📊</Text>
             <View style={[s.reportCard, cardShadow]}>
@@ -2721,98 +2981,872 @@ function ExpenseReportsScreen({ onMenuPress }) {
   );
 }
 
-// ───────────── BUY SECTION ─────────────
-function BuySection() {
-  const [minimized, setMinimized] = useState(true);
+// ───────────── BUY SCREEN ─────────────
+function BuyScreen({ onMenuPress }) {
   const [items, setItems] = useState([]);
   const [newItem, setNewItem] = useState("");
+  const [newPriceMin, setNewPriceMin] = useState("");
+  const [newPriceMax, setNewPriceMax] = useState("");
+  const [currentBalance, setCurrentBalance] = useState(0);
+  const [addOpen, setAddOpen] = useState(false);
 
-  const loadItems = useCallback(async () => {
-    const data = await listBuyItems();
+  const loadData = useCallback(async () => {
+    const [data, bal] = await Promise.all([
+      listBuyItems(),
+      getTotalAccountBalance(),
+    ]);
     setItems(data);
+    setCurrentBalance(bal);
   }, []);
 
-  useEffect(() => {
-    loadItems();
-  }, [loadItems]);
+  useEffect(() => { loadData(); }, [loadData]);
 
   async function handleAdd() {
     if (!newItem.trim()) return;
-    await addBuyItem(newItem);
+    await addBuyItem(newItem.trim(), parseFloat(newPriceMin) || 0, parseFloat(newPriceMax) || 0);
     setNewItem("");
-    loadItems();
+    setNewPriceMin("");
+    setNewPriceMax("");
+    setAddOpen(false);
+    loadData();
   }
 
   async function handleToggle(id) {
     await toggleBuyItem(id);
-    loadItems();
+    loadData();
   }
 
   async function handleDelete(id) {
     await deleteBuyItem(id);
-    loadItems();
+    loadData();
+  }
+
+  async function moveItem(index, direction) {
+    const swapIndex = index + direction;
+    if (swapIndex < 0 || swapIndex >= items.length) return;
+    await swapBuyItemsOrder(items[index], items[swapIndex]);
+    loadData();
+  }
+
+  function getAffordStatus(item) {
+    const min = item.price_min || 0;
+    const max = item.price_max || 0;
+    if (!max && !min) return "none";
+    if (currentBalance >= max && max > 0) return "green";
+    if (currentBalance < min) return "red";
+    return "yellow";
+  }
+
+  const balanceColor = currentBalance >= 0 ? colors.positive : colors.negative;
+
+  const pendingItems = items.filter((i) => !i.completed);
+  const doneItems = items.filter((i) => i.completed);
+
+  function renderItem(item, index, allItems) {
+    const status = getAffordStatus(item);
+    const dotColor = status === "green" ? "#22C55E" : status === "red" ? "#EF4444" : status === "yellow" ? "#FBBF24" : colors.textFaint;
+    const borderColor = status === "green" ? "#22C55E40" : status === "red" ? "#EF444440" : colors.border;
+    const textColor = status === "green" ? "#22C55E" : status === "red" ? "#EF4444" : status === "yellow" ? "#FBBF24" : colors.text;
+    const realIndex = items.indexOf(item);
+
+    return (
+      <View
+        key={item.id}
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          backgroundColor: colors.surface,
+          borderRadius: 14,
+          padding: 12,
+          marginBottom: 8,
+          borderWidth: 1,
+          borderColor,
+          gap: 10,
+        }}
+      >
+        {/* Priority handle: up/down arrows */}
+        {!item.completed && (
+          <View style={{ alignItems: "center", gap: 1 }}>
+            <Pressable onPress={() => moveItem(realIndex, -1)} hitSlop={8}
+              style={{ opacity: realIndex === 0 ? 0.2 : 1 }}>
+              <Text style={{ color: colors.textFaint, fontSize: 13, lineHeight: 16 }}>▲</Text>
+            </Pressable>
+            <View style={{ width: 18, height: 3, backgroundColor: colors.border, borderRadius: 2 }} />
+            <View style={{ width: 18, height: 3, backgroundColor: colors.border, borderRadius: 2 }} />
+            <Pressable onPress={() => moveItem(realIndex, 1)} hitSlop={8}
+              style={{ opacity: realIndex === pendingItems.length - 1 ? 0.2 : 1 }}>
+              <Text style={{ color: colors.textFaint, fontSize: 13, lineHeight: 16 }}>▼</Text>
+            </Pressable>
+          </View>
+        )}
+
+        {/* Item info */}
+        <View style={{ flex: 1 }}>
+          <Text style={{
+            color: item.completed ? colors.textFaint : textColor,
+            fontSize: 14,
+            fontWeight: "600",
+            textDecorationLine: item.completed ? "line-through" : "none",
+          }}>
+            {item.title}
+          </Text>
+          {(item.price_min > 0 || item.price_max > 0) && (
+            <Text style={{ color: colors.textFaint, fontSize: 11, marginTop: 2 }}>
+              {item.price_min > 0 && item.price_max > 0
+                ? `₹${item.price_min} – ₹${item.price_max}`
+                : item.price_max > 0
+                ? `Up to ₹${item.price_max}`
+                : `From ₹${item.price_min}`}
+            </Text>
+          )}
+        </View>
+
+        {/* Affordability badge */}
+        {status !== "none" && (
+          <Text style={{ fontSize: 16 }}>
+            {status === "green" ? "🟢" : status === "red" ? "🔴" : "🟡"}
+          </Text>
+        )}
+
+        {/* Checkbox */}
+        <Pressable
+          onPress={() => handleToggle(item.id)}
+          style={[s.buyCheckbox, item.completed && s.buyCheckboxCompleted]}
+        >
+          {item.completed && <Text style={s.buyCheckmark}>✓</Text>}
+        </Pressable>
+
+        {/* Delete */}
+        <Pressable onPress={() => handleDelete(item.id)} hitSlop={8}>
+          <Text style={s.entryDeleteX}>×</Text>
+        </Pressable>
+      </View>
+    );
   }
 
   return (
-    <View style={[s.buyCard, cardShadow]}>
-      <View style={s.buyHeader}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-          <Image source={APP_ICONS.buy} style={{ width: 18, height: 18 }} />
-          <Text style={s.buyTitle}>Buy List 🛒</Text>
-        </View>
-        <Pressable
-          onPress={() => setMinimized((prev) => !prev)}
-          hitSlop={10}
-          style={s.buyToggleBtn}
-        >
-          <Text style={s.buyToggleIcon}>{minimized ? "+" : "−"}</Text>
-        </Pressable>
-      </View>
+    <View style={s.screen}>
+      <ScreenHeader title="Buy List 🛒" onMenuPress={onMenuPress} iconKey="buy" />
 
-      {!minimized && (
-        <View style={{ marginTop: 10 }}>
-          <View style={s.buyInputRow}>
+      <ScrollView
+        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 100 + TAB_BAR_HEIGHT }}
+        keyboardShouldPersistTaps="handled"
+      >
+        {/* Balance card */}
+        <View style={[s.summaryCard, cardShadow, { marginTop: 10, marginBottom: 4 }]}>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <View>
+              <Text style={s.balanceLabel}>ACCOUNT BALANCE 💳</Text>
+              <Text style={[s.balanceValueLg, { color: balanceColor, marginTop: 2 }]}>
+                ₹{currentBalance.toFixed(0)}
+              </Text>
+            </View>
+            <View style={{ alignItems: "flex-end", gap: 4 }}>
+              <Text style={{ color: colors.textFaint, fontSize: 10 }}>🟢 Can afford</Text>
+              <Text style={{ color: colors.textFaint, fontSize: 10 }}>🟡 Partial range</Text>
+              <Text style={{ color: colors.textFaint, fontSize: 10 }}>🔴 Out of budget</Text>
+            </View>
+          </View>
+        </View>
+
+        {/* Pending items */}
+        {pendingItems.length > 0 && (
+          <Text style={[s.listLabel, { marginTop: 14 }]}>Priority Queue 📋 · drag to reorder</Text>
+        )}
+        {pendingItems.map((item, idx) => renderItem(item, idx, pendingItems))}
+
+        {/* Done items */}
+        {doneItems.length > 0 && (
+          <>
+            <Text style={[s.listLabel, { marginTop: 14 }]}>Done ✅</Text>
+            {doneItems.map((item, idx) => renderItem(item, idx, doneItems))}
+          </>
+        )}
+
+        {items.length === 0 && (
+          <View style={[s.emptyStateContainer, { marginTop: 30 }]}>
+            <Image source={APP_ICONS.buy} style={s.emptyIcon} />
+            <Text style={s.emptyText}>No items in your buy list yet! 🛒{"\n"}Tap + to add your first item.</Text>
+          </View>
+        )}
+
+        {/* Add form */}
+        {addOpen && (
+          <View style={[s.summaryCard, cardShadow, { marginTop: 16 }]}>
+            <Text style={[s.label, { marginTop: 0 }]}>Item name</Text>
             <TextInput
               value={newItem}
               onChangeText={setNewItem}
-              placeholder="Add item to buy..."
+              placeholder="e.g. AirPods, Running Shoes..."
               placeholderTextColor={colors.textFaint}
-              style={s.buyInput}
+              style={s.input}
+              autoFocus
               onSubmitEditing={handleAdd}
             />
-            <Pressable onPress={handleAdd} style={s.buyAddBtn}>
-              <Text style={s.buyAddBtnText}>+</Text>
+            <Text style={s.label}>Price range (₹)</Text>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <TextInput
+                value={newPriceMin}
+                onChangeText={setNewPriceMin}
+                placeholder="Min ₹"
+                placeholderTextColor={colors.textFaint}
+                keyboardType="numeric"
+                style={[s.input, { flex: 1 }]}
+              />
+              <TextInput
+                value={newPriceMax}
+                onChangeText={setNewPriceMax}
+                placeholder="Max ₹"
+                placeholderTextColor={colors.textFaint}
+                keyboardType="numeric"
+                style={[s.input, { flex: 1 }]}
+              />
+            </View>
+            <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+              <Pressable
+                onPress={() => setAddOpen(false)}
+                style={[s.saveBtn, { flex: 1, backgroundColor: colors.surfaceRaised, borderWidth: 1, borderColor: colors.border }]}
+              >
+                <Text style={{ color: colors.textMuted, fontWeight: "700" }}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                onPress={handleAdd}
+                style={[s.saveBtn, { flex: 2, backgroundColor: "#4ADE80" }]}
+              >
+                <Text style={s.saveBtnText}>Add to List ✅</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+      </ScrollView>
+
+      {/* FAB */}
+      {!addOpen && (
+        <Pressable
+          style={[s.fab, cardShadow, { backgroundColor: "#4ADE80", bottom: BOTTOM_INSET + 20 + TAB_BAR_HEIGHT }]}
+          onPress={() => setAddOpen(true)}
+        >
+          <Text style={s.fabText}>+</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+// ───────────── PRESET AVATARS ─────────────
+const PRESET_AVATARS = [
+  { id: "winnie", name: "Winnie", uri: "https://images.unsplash.com/photo-1543466835-00a7907e9de1?w=150" },
+  { id: "luffy", name: "Luffy", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Luffy&backgroundColor=ffd5dc" },
+  { id: "naruto", name: "Naruto", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Naruto&backgroundColor=ffdfbf" },
+  { id: "shinobu", name: "Shinobu", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Shinobu&backgroundColor=d1d4f9" },
+  { id: "minato", name: "Minato", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Minato&backgroundColor=c0aede" },
+  { id: "inosuke", name: "Inosuke", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Inosuke&backgroundColor=b6e3f4" },
+  { id: "jiraiya", name: "Jiraiya", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Jiraiya&backgroundColor=d1d4f9" },
+];
+
+// ───────────── PROFILE & SETTINGS MODAL ─────────────
+function ProfileModal({ visible, onClose, authData, onUpdateUser, onSignOut }) {
+  const user = authData?.user || { name: "Friend", email: "" };
+  const [activeTab, setActiveTab] = useState("avatar");
+  const [customUrl, setCustomUrl] = useState("");
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+
+  return (
+    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+      <Pressable style={s.modalBackdrop} onPress={onClose} />
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        style={s.sheetWrap}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 20 : 0}
+        pointerEvents="box-none"
+      >
+        <ScrollView
+          contentContainerStyle={{ flexGrow: 1, justifyContent: "flex-end" }}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          bounces={false}
+        >
+          <View style={[s.sheetCompact, { maxHeight: "90%" }]}>
+            <View style={s.grabber} />
+
+            {/* Profile Overview Card */}
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 14, marginBottom: 18 }}>
+              <View style={s.profileLargeAvatarWrap}>
+                {user.picture ? (
+                  <Image source={{ uri: user.picture }} style={s.profileLargeAvatar} />
+                ) : (
+                  <View style={s.profileLargeAvatarPlaceholder}>
+                    <Text style={s.profileLargeAvatarInitial}>{(user.name || "W")[0].toUpperCase()}</Text>
+                  </View>
+                )}
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={s.profileUserName} numberOfLines={1}>{user.name || "Explorer"}</Text>
+                <Text style={s.profileUserEmail} numberOfLines={1}>{user.email || "No email"}</Text>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }}>
+                  <View style={[s.dotSolid, { backgroundColor: authData?.token ? colors.habitGreen : colors.notes }]} />
+                  <Text style={{ color: colors.textMuted, fontSize: 11, fontWeight: "600" }}>
+                    {authData?.token ? "Google Account Connected" : "Demo Account"}
+                  </Text>
+                </View>
+              </View>
+            </View>
+
+            {/* Navigation Options List */}
+            <View style={s.profileOptionsContainer}>
+              {/* Option 1: Profile & Avatar */}
+              <TouchableOpacity
+                onPress={() => setActiveTab(activeTab === "avatar" ? null : "avatar")}
+                style={[s.profileOptionCard, activeTab === "avatar" && s.profileOptionCardActive]}
+                activeOpacity={0.8}
+              >
+                <View style={s.profileOptionIconWrap}>
+                  <Text style={{ fontSize: 20 }}>🖼️</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.profileOptionTitle}>Profile Picture</Text>
+                  <Text style={s.profileOptionSub}>Choose an avatar or paste custom photo URL</Text>
+                </View>
+                <Text style={{ color: colors.textMuted, fontSize: 16 }}>{activeTab === "avatar" ? "▲" : "▼"}</Text>
+              </TouchableOpacity>
+
+              {/* Avatar Selector Dropdown */}
+              {activeTab === "avatar" && (
+                <View style={s.avatarSelectionBox}>
+                  <Text style={[s.label, { marginTop: 0 }]}>Select Character Avatar:</Text>
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 10, paddingVertical: 4 }}>
+                    {PRESET_AVATARS.map((av) => (
+                      <TouchableOpacity
+                        key={av.id}
+                        onPress={() => {
+                          onUpdateUser({ ...user, picture: av.uri });
+                        }}
+                        style={[s.avatarThumbnailWrap, user.picture === av.uri && s.avatarThumbnailWrapSelected]}
+                      >
+                        <Image source={{ uri: av.uri }} style={s.avatarThumbnail} />
+                        <Text style={s.avatarLabel}>{av.name}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+
+                  <Text style={[s.label, { marginTop: 10 }]}>Or Paste Custom Image URL:</Text>
+                  <View style={{ flexDirection: "row", gap: 8 }}>
+                    <TextInput
+                      value={customUrl}
+                      onChangeText={setCustomUrl}
+                      placeholder="https://example.com/avatar.png"
+                      placeholderTextColor={colors.textFaint}
+                      style={[s.input, { flex: 1 }]}
+                    />
+                    <Pressable
+                      onPress={() => {
+                        if (customUrl.trim()) {
+                          onUpdateUser({ ...user, picture: customUrl.trim() });
+                          setCustomUrl("");
+                        }
+                      }}
+                      style={[s.saveBtn, { marginTop: 0, paddingHorizontal: 16, backgroundColor: colors.streakOrange }]}
+                    >
+                      <Text style={s.saveBtnText}>Apply</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              )}
+
+              {/* Option 2: Theme */}
+              <TouchableOpacity
+                onPress={() => setActiveTab(activeTab === "theme" ? null : "theme")}
+                style={[s.profileOptionCard, activeTab === "theme" && s.profileOptionCardActive]}
+                activeOpacity={0.8}
+              >
+                <View style={s.profileOptionIconWrap}>
+                  <Text style={{ fontSize: 20 }}>🌙</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.profileOptionTitle}>Theme</Text>
+                  <Text style={s.profileOptionSub}>Dark Theme (Default) · OLED optimized</Text>
+                </View>
+                <View style={s.themeBadge}>
+                  <Text style={s.themeBadgeText}>Dark ✓</Text>
+                </View>
+              </TouchableOpacity>
+
+              {/* Option 3: Notifications */}
+              <TouchableOpacity
+                onPress={() => setNotificationsEnabled((prev) => !prev)}
+                style={s.profileOptionCard}
+                activeOpacity={0.8}
+              >
+                <View style={s.profileOptionIconWrap}>
+                  <Text style={{ fontSize: 20 }}>🔔</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.profileOptionTitle}>Notifications & Reminders</Text>
+                  <Text style={s.profileOptionSub}>15 mins before & at due time on Google Calendar</Text>
+                </View>
+                <View style={[s.notificationTogglePill, notificationsEnabled ? s.notificationToggleActive : s.notificationToggleInactive]}>
+                  <Text style={{ color: "#FFF", fontSize: 11, fontWeight: "800" }}>{notificationsEnabled ? "ON" : "OFF"}</Text>
+                </View>
+              </TouchableOpacity>
+
+              {/* Option 4: Logout */}
+              <TouchableOpacity
+                onPress={() => {
+                  Alert.alert("Sign Out", "Are you sure you want to log out of Winnie?", [
+                    { text: "Cancel", style: "cancel" },
+                    {
+                      text: "Log Out",
+                      style: "destructive",
+                      onPress: () => {
+                        onClose();
+                        onSignOut();
+                      },
+                    },
+                  ]);
+                }}
+                style={[s.profileOptionCard, { borderColor: "rgba(239, 68, 68, 0.3)", marginTop: 6 }]}
+                activeOpacity={0.8}
+              >
+                <View style={[s.profileOptionIconWrap, { backgroundColor: "rgba(239, 68, 68, 0.15)" }]}>
+                  <Text style={{ fontSize: 20 }}>🚪</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[s.profileOptionTitle, { color: colors.negative }]}>Log Out</Text>
+                  <Text style={s.profileOptionSub}>Sign out and clear session cache</Text>
+                </View>
+              </TouchableOpacity>
+            </View>
+
+            <Pressable onPress={onClose} style={[s.saveBtn, { backgroundColor: colors.surfaceHighlight, marginTop: 16 }]}>
+              <Text style={{ color: colors.text, fontWeight: "700" }}>Done</Text>
             </Pressable>
           </View>
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
 
-          {items.map((item) => (
-            <SwipeableRow
-              key={item.id}
-              onSwipeDelete={() => handleDelete(item.id)}
+// ───────────── TASK EDITOR MODAL ─────────────
+function TaskEditorModal({ visible, task, onClose, onSaved }) {
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [dueDate, setDueDate] = useState(todayISO());
+  const [dueTime, setDueTime] = useState("09:00");
+  const [priority, setPriority] = useState("medium");
+  const [category, setCategory] = useState("General");
+  const [repeat, setRepeat] = useState("none");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (visible) {
+      if (task) {
+        setTitle(task.title || "");
+        setDescription(task.description || "");
+        setDueDate(task.due_date || todayISO());
+        setDueTime(task.due_time || "09:00");
+        setPriority(task.priority || "medium");
+        setCategory(task.category || "General");
+        setRepeat(task.repeat || "none");
+      } else {
+        setTitle("");
+        setDescription("");
+        setDueDate(todayISO());
+        setDueTime("09:00");
+        setPriority("medium");
+        setCategory("General");
+        setRepeat("none");
+      }
+    }
+  }, [visible, task]);
+
+  async function handleSave() {
+    if (!title.trim()) return;
+    setSaving(true);
+    try {
+      if (task?.id) {
+        await updateTask(task.id, {
+          title: title.trim(),
+          description: description.trim(),
+          dueDate,
+          dueTime,
+          priority,
+          category,
+          repeat,
+          googleEventId: task.google_event_id,
+        });
+      } else {
+        await addTask({
+          title: title.trim(),
+          description: description.trim(),
+          dueDate,
+          dueTime,
+          priority,
+          category,
+          repeat,
+        });
+      }
+      onSaved();
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const CATEGORIES = ["General", "Work", "Personal", "Health", "Shopping"];
+  const PRIORITIES = [
+    { key: "high", label: "High 🔴", color: colors.negative },
+    { key: "medium", label: "Medium 🟡", color: colors.streakGold },
+    { key: "low", label: "Low 🟢", color: colors.habitGreen },
+  ];
+  const DATE_PRESETS = [
+    { label: "Today", date: todayISO() },
+    { label: "Tomorrow", date: addDays(todayISO(), 1) },
+    { label: "+3 Days", date: addDays(todayISO(), 3) },
+    { label: "Next Week", date: addDays(todayISO(), 7) },
+  ];
+  const TIME_PRESETS = ["09:00", "13:00", "18:00", "21:00"];
+
+  return (
+    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+      <Pressable style={s.modalBackdrop} onPress={onClose} />
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        style={s.sheetWrap}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 20 : 0}
+        pointerEvents="box-none"
+      >
+        <ScrollView
+          contentContainerStyle={{ flexGrow: 1, justifyContent: "flex-end" }}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          bounces={false}
+        >
+          <View style={[s.sheetCompact, { maxHeight: "90%" }]}>
+            <View style={s.grabber} />
+            <Text style={s.modalHeaderTitle}>{task ? "Edit Task / Reminder ✏️" : "New Task & Reminder ⏰"}</Text>
+
+            <Text style={[s.label, { marginTop: 0 }]}>Task Title *</Text>
+            <TextInput
+              value={title}
+              onChangeText={setTitle}
+              placeholder="What do you need to do?"
+              placeholderTextColor={colors.textFaint}
+              style={s.input}
+              autoFocus={!task}
+            />
+
+            
+
+            {/* Due Date */}
+            <Text style={s.label}>Due Date 📅</Text>
+            <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
+              {DATE_PRESETS.map((p) => (
+                <TouchableOpacity
+                  key={p.label}
+                  onPress={() => setDueDate(p.date)}
+                  style={[s.presetPill, dueDate === p.date && s.presetPillActive]}
+                >
+                  <Text style={[s.presetPillText, dueDate === p.date && s.presetPillTextActive]}>{p.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <TextInput
+              value={dueDate}
+              onChangeText={setDueDate}
+              placeholder="YYYY-MM-DD"
+              placeholderTextColor={colors.textFaint}
+              style={s.input}
+            />
+
+            {/* Due Time */}
+            <Text style={s.label}>Due Time ⏰</Text>
+            <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
+              {TIME_PRESETS.map((t) => (
+                <TouchableOpacity
+                  key={t}
+                  onPress={() => setDueTime(t)}
+                  style={[s.presetPill, dueTime === t && s.presetPillActive]}
+                >
+                  <Text style={[s.presetPillText, dueTime === t && s.presetPillTextActive]}>{t}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <TextInput
+              value={dueTime}
+              onChangeText={setDueTime}
+              placeholder="HH:mm (e.g. 14:30)"
+              placeholderTextColor={colors.textFaint}
+              style={s.input}
+            />
+
+            {/* Repeat */}
+            <Text style={s.label}>Repeat</Text>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              {["none", "daily", "weekly"].map((r) => (
+                <TouchableOpacity
+                  key={r}
+                  onPress={() => setRepeat(r)}
+                  style={[s.presetPill, repeat === r && s.presetPillActive]}
+                >
+                  <Text style={[s.presetPillText, repeat === r && s.presetPillTextActive]}>
+                    {r === "none" ? "Do Not Repeat" : r === "daily" ? "Every Day" : "Every Week"}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Pressable
+              onPress={handleSave}
+              disabled={saving}
+              style={[s.saveBtn, { backgroundColor: "#38BDF8", opacity: saving ? 0.6 : 1, marginTop: 14 }]}
             >
-              <View style={s.buyItemRow}>
-                <Text
-                  style={[
-                    s.buyItemText,
-                    item.completed && s.buyItemTextCompleted,
-                  ]}
-                >
-                  {item.title}
-                </Text>
-                <Pressable
-                  onPress={() => handleToggle(item.id)}
-                  style={[
-                    s.buyCheckbox,
-                    item.completed && s.buyCheckboxCompleted,
-                  ]}
-                >
-                  {item.completed ? <Text style={s.buyCheckmark}>✓</Text> : null}
-                </Pressable>
-              </View>
-            </SwipeableRow>
+              <Text style={s.saveBtnText}>{saving ? "Saving..." : task ? "Update Task 🔄" : "Save Task & Reminder 🚀"}</Text>
+            </Pressable>
+          </View>
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+// ───────────── TASKS SCREEN ─────────────
+function TasksScreen({ onMenuPress }) {
+  const [tasks, setTasks] = useState([]);
+  const [filter, setFilter] = useState("all");
+  const [categoryFilter, setCategoryFilter] = useState("All");
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState(null);
+
+  const loadData = useCallback(async () => {
+    const list = await listTasks();
+    setTasks(list);
+  }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  async function handleToggle(task) {
+    await toggleTask(task.id);
+    loadData();
+  }
+
+  async function handleDelete(task) {
+    Alert.alert("Delete Task?", `Remove "${task.title}"?`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: async () => {
+          await deleteTask(task.id, task.google_event_id);
+          loadData();
+        },
+      },
+    ]);
+  }
+
+  const today = todayISO();
+  const filteredTasks = tasks.filter((t) => {
+    if (filter === "today") {
+      if (t.completed) return false;
+      return t.due_date <= today;
+    }
+    if (filter === "upcoming") {
+      if (t.completed) return false;
+      return t.due_date > today;
+    }
+    if (filter === "completed") {
+      return t.completed;
+    }
+    return true;
+  }).filter((t) => {
+    if (categoryFilter === "All") return true;
+    return t.category === categoryFilter;
+  });
+
+  const pendingCount = tasks.filter((t) => !t.completed).length;
+  const todayCount = tasks.filter((t) => !t.completed && t.due_date <= today).length;
+
+  return (
+    <View style={s.screen}>
+      <ScreenHeader title="Tasks & Reminders" onMenuPress={onMenuPress} iconKey="tasks" />
+
+      <ScrollView
+        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 90 + TAB_BAR_HEIGHT }}
+        showsVerticalScrollIndicator={false}
+      >
+        {/* Banner */}
+        <View style={s.bannerCard}>
+          <EditableImage
+            imageKey="banner_tasks"
+            defaultSource={LOCAL_ASSETS.minato}
+            style={s.bannerImage}
+            resizeMode="contain"
+          />
+          <View style={s.bannerOverlay}>
+            <Text style={s.bannerTitle}>Focus & Achieve 🎯</Text>
+            <Text style={s.bannerSub}>Smart reminders synced to your Google Calendar ⚡</Text>
+          </View>
+        </View>
+
+        {/* Stats card */}
+        <View style={[s.summaryCard, cardShadow, { marginTop: 14 }]}>
+          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <View>
+              <Text style={s.balanceLabel}>PENDING TASKS 📋</Text>
+              <Text style={[s.balanceValueLg, { color: "#38BDF8", marginTop: 2 }]}>
+                {pendingCount} Tasks
+              </Text>
+            </View>
+            <View style={{ alignItems: "flex-end" }}>
+              <Text style={s.balanceLabel}>DUE TODAY ⏰</Text>
+              <Text style={[s.balanceValueLg, { color: todayCount > 0 ? colors.streakOrange : colors.habitGreen, marginTop: 2 }]}>
+                {todayCount} Today
+              </Text>
+            </View>
+          </View>
+          <View style={s.cardDivider} />
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <Image source={APP_ICONS.calendar} style={{ width: 16, height: 16 }} />
+            <Text style={{ color: colors.textMuted, fontSize: 11, fontWeight: "600" }}>
+              Calendar Reminders: 15m before & at due time 🔔
+            </Text>
+          </View>
+        </View>
+
+        {/* Filter Switcher */}
+        <View style={[s.segment, { marginTop: 14 }]}>
+          {[
+            { key: "all", label: "All 📋" },
+            { key: "today", label: "Today 📅" },
+            { key: "upcoming", label: "Upcoming 🗓️" },
+            { key: "completed", label: "Done ✅" },
+          ].map((f) => (
+            <Pressable
+              key={f.key}
+              onPress={() => setFilter(f.key)}
+              style={[s.segmentBtn, filter === f.key && { backgroundColor: "#38BDF8" }]}
+            >
+              <Text style={[s.segmentText, filter === f.key && s.segmentTextActive]}>{f.label}</Text>
+            </Pressable>
           ))}
         </View>
-      )}
+
+
+        {/* Task Cards */}
+        {filteredTasks.length === 0 ? (
+          <View style={[s.emptyStateContainer, { marginTop: 24 }]}>
+            <Image source={APP_ICONS.empty} style={s.emptyIcon} />
+            <Text style={s.emptyText}>No tasks found in this view 🎯{"\n"}Tap + below to schedule a reminder!</Text>
+          </View>
+        ) : (
+          filteredTasks.map((t) => {
+            const isOverdue = !t.completed && t.due_date < today;
+            const isDueToday = !t.completed && t.due_date === today;
+            const priorityColor = t.priority === "high" ? colors.negative : t.priority === "medium" ? colors.streakGold : colors.habitGreen;
+
+            return (
+              <View
+                key={t.id}
+                style={[
+                  s.taskCard,
+                  cardShadow,
+                  t.completed && { opacity: 0.65 },
+                  isOverdue && { borderColor: "rgba(239, 68, 68, 0.4)" },
+                ]}
+              >
+                {/* Priority left stripe */}
+                <View style={[s.taskPriorityStripe, { backgroundColor: priorityColor }]} />
+
+                <View style={{ flex: 1, paddingVertical: 10, paddingHorizontal: 12 }}>
+                  <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10 }}>
+                    <TouchableOpacity
+                      onPress={() => handleToggle(t)}
+                      style={[s.buyCheckbox, t.completed && { backgroundColor: "#38BDF8", borderColor: "#38BDF8" }]}
+                    >
+                      {t.completed && <Text style={s.buyCheckmark}>✓</Text>}
+                    </TouchableOpacity>
+
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.taskTitle, t.completed && s.taskTitleCompleted]}>
+                        {t.title}
+                      </Text>
+                      {t.description ? (
+                        <Text style={s.taskDescription} numberOfLines={2}>
+                          {t.description}
+                        </Text>
+                      ) : null}
+
+                      {/* Badges Row */}
+                      <View style={s.taskBadgesRow}>
+                        <View style={[s.taskBadge, isOverdue && s.taskBadgeOverdue]}>
+                          <Text style={[s.taskBadgeText, isOverdue && { color: colors.negative }]}>
+                            {isDueToday ? `⏰ Today at ${t.due_time}` : isOverdue ? `⚠️ Overdue (${t.due_date})` : `⏰ ${t.due_date} ${t.due_time}`}
+                          </Text>
+                        </View>
+
+                        <View style={s.taskBadge}>
+                          <Text style={s.taskBadgeText}>{t.category}</Text>
+                        </View>
+
+                        {t.repeat !== "none" && (
+                          <View style={s.taskBadge}>
+                            <Text style={s.taskBadgeText}>🔁 {t.repeat}</Text>
+                          </View>
+                        )}
+
+                        {t.google_event_id ? (
+                          <View style={[s.taskBadge, { borderColor: "rgba(56, 189, 248, 0.4)" }]}>
+                            <Text style={[s.taskBadgeText, { color: "#38BDF8" }]}>📅 Synced (15m alert)</Text>
+                          </View>
+                        ) : null}
+                      </View>
+                    </View>
+                  </View>
+                </View>
+
+                {/* Actions */}
+                <View style={s.taskActionsCol}>
+                  <TouchableOpacity
+                    onPress={() => {
+                      setEditingTask(t);
+                      setEditorOpen(true);
+                    }}
+                    hitSlop={8}
+                    style={{ padding: 4 }}
+                  >
+                    <Text style={{ fontSize: 14 }}>✏️</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => handleDelete(t)}
+                    hitSlop={8}
+                    style={{ padding: 4 }}
+                  >
+                    <Text style={{ color: colors.textFaint, fontSize: 16, fontWeight: "700" }}>×</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            );
+          })
+        )}
+      </ScrollView>
+
+      {/* FAB */}
+      <Pressable
+        style={[s.fab, cardShadow, { backgroundColor: "#38BDF8", bottom: BOTTOM_INSET + 20 + TAB_BAR_HEIGHT }]}
+        onPress={() => {
+          setEditingTask(null);
+          setEditorOpen(true);
+        }}
+      >
+        <Text style={s.fabText}>+</Text>
+      </Pressable>
+
+      <TaskEditorModal
+        visible={editorOpen}
+        task={editingTask}
+        onClose={() => setEditorOpen(false)}
+        onSaved={loadData}
+      />
     </View>
   );
 }
@@ -2879,7 +3913,7 @@ function NotesScreen({ onMenuPress }) {
       <FlatList
         data={notes}
         keyExtractor={(item) => String(item.id)}
-        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 90 }}
+        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 90 + TAB_BAR_HEIGHT }}
         ListHeaderComponent={
           <View style={{ paddingTop: 10 }}>
             {/* HERO BANNER FOR NOTES */}
@@ -2895,9 +3929,6 @@ function NotesScreen({ onMenuPress }) {
                 <Text style={s.bannerSub}>Capture your grand thoughts & secret plans ✨</Text>
               </View>
             </View>
-
-            {/* Minimizable Buy Section at Top of Notes */}
-            <BuySection />
 
             <Text style={[s.listLabel, { marginTop: 18 }]}>Your Notes 📝</Text>
           </View>
@@ -2952,7 +3983,7 @@ function NotesScreen({ onMenuPress }) {
         }
       />
       <Pressable
-        style={[s.fab, cardShadow, { backgroundColor: colors.notes }]}
+        style={[s.fab, cardShadow, { backgroundColor: colors.notes, bottom: BOTTOM_INSET + 20 + TAB_BAR_HEIGHT }]}
         onPress={() => {
           setSelected(null);
           setEditorOpen(true);
@@ -2971,8 +4002,10 @@ const TABS = [
   { key: "expenses", label: "Expenses", accent: colors.expense },
   { key: "reports", label: "Reports", accent: colors.expense },
   { key: "progress", label: "Progress", accent: colors.streakOrange },
+  { key: "tasks", label: "Tasks", accent: "#38BDF8" },
   { key: "notes", label: "Notes", accent: colors.notes },
-  { key: "health", label: "Period Tracker", accent: colors.periods },
+  { key: "buy", label: "Buy", accent: "#4ADE80" },
+  { key: "health", label: "Health", accent: colors.periods },
 ];
 
 // ───────────── LOGIN SCREEN ─────────────
@@ -3137,6 +4170,7 @@ export default function App() {
   const [authData, setAuthData] = useState(null); // { token, user, gender, sheetId }
   const [tab, setTab] = useState("home");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState(null);
 
@@ -3156,6 +4190,7 @@ export default function App() {
       "https://www.googleapis.com/auth/userinfo.email",
       "https://www.googleapis.com/auth/spreadsheets",
       "https://www.googleapis.com/auth/drive.file",
+      "https://www.googleapis.com/auth/calendar.events",
     ],
     selectAccount: true,
   });
@@ -3222,24 +4257,43 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      await initDatabase();
-      const stored = await getStoredAuth();
-      if (stored.token || stored.user) {
-        if (stored.token && stored.sheetId) {
-          setSheetsContext(stored.token, stored.sheetId);
-        }
-        setAuthData(stored);
-        if (stored.gender) {
-          setAuthStep("main");
+      try {
+        await initDatabase();
+      } catch (err) {
+        console.warn("[AppInit] Database init error (fallback mode):", err);
+      }
+      try {
+        const stored = await getStoredAuth();
+        if (stored.token || stored.user) {
+          if (stored.token && stored.sheetId) {
+            setSheetsContext(stored.token, stored.sheetId);
+          }
+          setAuthData(stored);
+          if (stored.gender) {
+            setAuthStep("main");
+          } else {
+            setAuthStep("gender");
+          }
         } else {
-          setAuthStep("gender");
+          setAuthStep("login");
         }
-      } else {
+      } catch (err) {
+        console.warn("[AppInit] Stored auth error:", err);
         setAuthStep("login");
       }
       setReady(true);
     })();
   }, []);
+
+  async function handleUpdateUserProfile(updatedUser) {
+    const updated = {
+      ...(authData || {}),
+      user: updatedUser,
+    };
+    await saveAuthData(updated);
+    setAuthData(updated);
+    triggerTableSync("profile", 100);
+  }
 
   async function handleSelectGender(chosenGender) {
     const updated = {
@@ -3327,30 +4381,90 @@ export default function App() {
   });
 
   const openMenu = () => setDrawerOpen(true);
+  const openProfile = () => setProfileModalOpen(true);
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <ZoomContainer>
-        <View style={s.screen}>
-          <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
-          {tab === "home" && <HomeScreen onMenuPress={openMenu} />}
-          {tab === "expenses" && <ExpensesScreen focusKey={tab} onMenuPress={openMenu} />}
-          {tab === "reports" && <ExpenseReportsScreen onMenuPress={openMenu} />}
-          {tab === "progress" && <ProgressScreen onMenuPress={openMenu} />}
-          {tab === "notes" && <NotesScreen onMenuPress={openMenu} />}
-          {tab === "health" && userGender === "female" && <HealthScreen onMenuPress={openMenu} />}
+      <AppContext.Provider
+        value={{
+          openProfile,
+          userProfile: authData?.user,
+        }}
+      >
+        <ZoomContainer>
+          <View style={s.screen}>
+            <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
+            {tab === "home" && <HomeScreen onMenuPress={openMenu} />}
+            {tab === "tasks" && <TasksScreen onMenuPress={openMenu} />}
+            {tab === "expenses" && <ExpensesScreen focusKey={tab} onMenuPress={openMenu} />}
+            {tab === "reports" && <ExpenseReportsScreen onMenuPress={openMenu} />}
+            {tab === "progress" && <ProgressScreen onMenuPress={openMenu} />}
+            {tab === "notes" && <NotesScreen onMenuPress={openMenu} />}
+            {tab === "buy" && <BuyScreen onMenuPress={openMenu} />}
+            {tab === "health" && userGender === "female" && <HealthScreen onMenuPress={openMenu} />}
 
-          <Drawer
-            visible={drawerOpen}
-            onClose={() => setDrawerOpen(false)}
-            activeTab={tab === "health" && userGender === "male" ? "home" : tab}
-            onSelectTab={setTab}
-            tabs={currentTabs}
-            userProfile={authData?.user}
-            onSignOut={handleSignOut}
-          />
-        </View>
-      </ZoomContainer>
+            {/* ── BOTTOM TAB BAR (WhatsApp-style) ── */}
+            <View style={s.bottomTabBar}>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={s.bottomTabScrollContent}
+              >
+                {currentTabs.map((t) => {
+                  const isActive = tab === t.key;
+                  return (
+                    <Pressable
+                      key={t.key}
+                      onPress={() => setTab(t.key)}
+                      style={s.bottomTabItem}
+                      android_ripple={{ color: "rgba(255,255,255,0.08)", borderless: true }}
+                    >
+                      {APP_ICONS[t.key] ? (
+                        <Image
+                          source={APP_ICONS[t.key]}
+                          style={[s.bottomTabIcon, { opacity: isActive ? 1 : 0.35 }]}
+                        />
+                      ) : (
+                        <Text style={{ fontSize: 18, opacity: isActive ? 1 : 0.35 }}>•</Text>
+                      )}
+                      <Text
+                        style={[
+                          s.bottomTabLabel,
+                          { color: isActive ? t.accent : colors.textFaint, fontWeight: isActive ? "700" : "400" },
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {t.label}
+                      </Text>
+                      {isActive && (
+                        <View style={[s.bottomTabActiveDot, { backgroundColor: t.accent }]} />
+                      )}
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            </View>
+
+            <Drawer
+              visible={drawerOpen}
+              onClose={() => setDrawerOpen(false)}
+              activeTab={tab === "health" && userGender === "male" ? "home" : tab}
+              onSelectTab={setTab}
+              tabs={currentTabs}
+              userProfile={authData?.user}
+              onSignOut={handleSignOut}
+            />
+
+            <ProfileModal
+              visible={profileModalOpen}
+              onClose={() => setProfileModalOpen(false)}
+              authData={authData}
+              onUpdateUser={handleUpdateUserProfile}
+              onSignOut={handleSignOut}
+            />
+          </View>
+        </ZoomContainer>
+      </AppContext.Provider>
     </GestureHandlerRootView>
   );
 }
@@ -3686,7 +4800,7 @@ const s = StyleSheet.create({
   learningEntryText: { color: colors.text, fontSize: 13, flex: 1, lineHeight: 18 },
   learningEntryHint: { color: colors.textFaint, fontSize: 10, marginTop: 4 },
 
-  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)" },
+  modalBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.6)" },
   sheetWrap: { justifyContent: "flex-end", flex: 1 },
   sheet: {
     backgroundColor: colors.surfaceRaised,
@@ -4184,5 +5298,370 @@ const s = StyleSheet.create({
     borderRadius: 16,
     alignItems: "center",
     justifyContent: "center",
+  },
+
+  // ── Bottom Tab Bar ──
+  bottomTabBar: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: TAB_BAR_HEIGHT,
+    flexDirection: "row",
+    backgroundColor: colors.surface,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingBottom: Platform.OS === "ios" ? 12 : 4,
+    paddingTop: 4,
+    ...cardShadow,
+  },
+  bottomTabItem: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 2,
+    position: "relative",
+    paddingVertical: 2,
+  },
+  bottomTabIcon: {
+    width: 22,
+    height: 22,
+    resizeMode: "contain",
+  },
+  bottomTabLabel: {
+    fontSize: 9,
+    letterSpacing: 0.2,
+  },
+  bottomTabActiveDot: {
+    position: "absolute",
+    top: 0,
+    width: 24,
+    height: 2,
+    borderRadius: 1,
+  },
+
+  // ── Reports Loading ──
+  reportLoadingContainer: {
+    alignItems: "center",
+    paddingVertical: 48,
+    gap: 12,
+  },
+  reportLoadingIconWrap: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: colors.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  reportLoadingTitle: {
+    color: colors.text,
+    fontSize: 15,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  reportLoadingSub: {
+    color: colors.textMuted,
+    fontSize: 12,
+    textAlign: "center",
+  },
+
+  // ── Header Profile Button ──
+  profileHeaderBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    borderWidth: 1.5,
+    borderColor: colors.streakOrange,
+    overflow: "hidden",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surfaceRaised,
+    marginLeft: 10,
+    ...cardShadow,
+  },
+  profileHeaderAvatar: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 19,
+  },
+  profileHeaderPlaceholder: {
+    width: "100%",
+    height: "100%",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surfaceHighlight,
+  },
+  profileHeaderInitial: {
+    color: colors.streakOrange,
+    fontSize: 16,
+    fontWeight: "900",
+  },
+
+  // ── Bottom Tab Bar Scroll Content ──
+  bottomTabScrollContent: {
+    flexGrow: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-around",
+    paddingHorizontal: 6,
+  },
+
+  // ── Profile Modal ──
+  profileLargeAvatarWrap: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    borderWidth: 2,
+    borderColor: colors.streakOrange,
+    overflow: "hidden",
+    backgroundColor: colors.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+    ...cardShadow,
+  },
+  profileLargeAvatar: {
+    width: "100%",
+    height: "100%",
+  },
+  profileLargeAvatarPlaceholder: {
+    width: "100%",
+    height: "100%",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surfaceHighlight,
+  },
+  profileLargeAvatarInitial: {
+    color: colors.streakOrange,
+    fontSize: 28,
+    fontWeight: "900",
+  },
+  profileUserName: {
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: "800",
+  },
+  profileUserEmail: {
+    color: colors.textMuted,
+    fontSize: 12,
+    marginTop: 2,
+  },
+  profileOptionsContainer: {
+    gap: 10,
+    marginTop: 6,
+  },
+  profileOptionCard: {
+    backgroundColor: colors.surface,
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: colors.border,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  profileOptionCardActive: {
+    borderColor: colors.streakOrange,
+  },
+  profileOptionIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: colors.surfaceRaised,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  profileOptionTitle: {
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  profileOptionSub: {
+    color: colors.textMuted,
+    fontSize: 11,
+    marginTop: 2,
+  },
+  avatarSelectionBox: {
+    backgroundColor: colors.surfaceRaised,
+    borderRadius: 14,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  avatarThumbnailWrap: {
+    alignItems: "center",
+    padding: 4,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: "transparent",
+  },
+  avatarThumbnailWrapSelected: {
+    borderColor: colors.streakOrange,
+    backgroundColor: "rgba(255, 107, 53, 0.15)",
+  },
+  avatarThumbnail: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: colors.surface,
+  },
+  avatarLabel: {
+    color: colors.textMuted,
+    fontSize: 10,
+    marginTop: 4,
+    fontWeight: "600",
+  },
+  themeBadge: {
+    backgroundColor: colors.surfaceRaised,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  themeBadgeText: {
+    color: colors.habitGreen,
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  notificationTogglePill: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 10,
+  },
+  notificationToggleActive: {
+    backgroundColor: colors.habitGreen,
+  },
+  notificationToggleInactive: {
+    backgroundColor: colors.textFaint,
+  },
+
+  // ── Tasks Screen Styles ──
+  taskCard: {
+    backgroundColor: colors.surface,
+    borderRadius: 14,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    flexDirection: "row",
+    overflow: "hidden",
+  },
+  taskPriorityStripe: {
+    width: 5,
+  },
+  taskTitle: {
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  taskTitleCompleted: {
+    color: colors.textFaint,
+    textDecorationLine: "line-through",
+  },
+  taskDescription: {
+    color: colors.textMuted,
+    fontSize: 12,
+    marginTop: 4,
+    lineHeight: 16,
+  },
+  taskBadgesRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 8,
+  },
+  taskBadge: {
+    backgroundColor: colors.surfaceRaised,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  taskBadgeOverdue: {
+    borderColor: "rgba(239, 68, 68, 0.5)",
+    backgroundColor: "rgba(239, 68, 68, 0.12)",
+  },
+  taskBadgeText: {
+    color: colors.textMuted,
+    fontSize: 10,
+    fontWeight: "600",
+  },
+  taskActionsCol: {
+    justifyContent: "space-around",
+    alignItems: "center",
+    paddingRight: 10,
+    paddingVertical: 10,
+  },
+  categoryFilterPill: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 10,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  categoryFilterPillActive: {
+    backgroundColor: "#38BDF8",
+    borderColor: "#38BDF8",
+  },
+  categoryFilterText: {
+    color: colors.textMuted,
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  categoryFilterTextActive: {
+    color: "#FFF",
+    fontWeight: "800",
+  },
+  presetPill: {
+    backgroundColor: colors.surface,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  presetPillActive: {
+    backgroundColor: "#38BDF8",
+    borderColor: "#38BDF8",
+  },
+  presetPillText: {
+    color: colors.textMuted,
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  presetPillTextActive: {
+    color: "#FFF",
+    fontWeight: "800",
+  },
+  prioritySelectBtn: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+  },
+  calendarNoticeCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "rgba(56, 189, 248, 0.1)",
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.3)",
+    borderRadius: 12,
+    padding: 10,
+    marginTop: 12,
+  },
+  calendarNoticeText: {
+    color: "#38BDF8",
+    fontSize: 11,
+    fontWeight: "600",
+    flex: 1,
   },
 });
