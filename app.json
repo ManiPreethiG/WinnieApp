@@ -12,6 +12,7 @@
       "bundleIdentifier": "com.preeth.winnie"
     },
     "android": {
+      "softwareKeyboardLayoutMode": "resize",
       "package": "com.preeth.winnie",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",

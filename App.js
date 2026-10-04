@@ -41,9 +41,9 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants, { AppOwnership } from "expo-constants";
 
 // Modular imports
-import Drawer from "./src/components/Drawer";
 import ZoomContainer from "./src/components/ZoomContainer";
 import EditableImage from "./src/components/EditableImage";
+import { setThemeColors as setSharedThemeColors } from "./src/constants/theme";
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -104,7 +104,7 @@ const APP_ICONS = {
 };
 
 // ───────────── THEME & PALETTE ─────────────
-const colors = {
+const darkColors = {
   bg: "#120F0D",
   surface: "#1C1714",
   surfaceRaised: "#26201B",
@@ -128,6 +128,63 @@ const colors = {
   notes: "#818CF8",
   reminders: "#C084FC",
 };
+
+const lightColors = {
+  bg: "#F8F6F2",
+  surface: "#FFFFFF",
+  surfaceRaised: "#F1EBE3",
+  surfaceHighlight: "#E6DFD4",
+  border: "#DDD6CB",
+  borderLight: "#CDC4B5",
+  text: "#1C1714",
+  textMuted: "#6B6055",
+  textFaint: "#9C9287",
+  habitGreen: "#16A34A",
+  habitGreenGlow: "rgba(22, 163, 74, 0.25)",
+  streakOrange: "#EA580C",
+  streakOrangeGlow: "rgba(234, 88, 12, 0.25)",
+  streakGold: "#D97706",
+  positive: "#16A34A",
+  negative: "#DC2626",
+  expense: "#D97706",
+  progress: "#EA580C",
+  periods: "#DB2777",
+  periodsDark: "#9D174D",
+  notes: "#6366F1",
+  reminders: "#9333EA",
+};
+
+const colors = { ...darkColors };
+
+function applyTheme(mode) {
+  const target = mode === "light" ? lightColors : darkColors;
+  Object.assign(colors, target);
+  setSharedThemeColors(mode);
+  if (typeof createAppStyles === "function") {
+    Object.assign(s, createAppStyles(colors));
+  }
+}
+
+const CHART_COLORS = [
+  "#6366F1", "#10B981", "#F59E0B", "#EC4899", "#06B6D4",
+  "#8B5CF6", "#F97316", "#14B8A6", "#3B82F6", "#E11D48",
+  "#84CC16", "#D946EF", "#0EA5E9", "#F43F5E", "#A855F7",
+  "#22C55E", "#EAB308", "#FB7185", "#2DD4BF", "#818CF8",
+  "#FB923C", "#4ADE80", "#C084FC", "#38BDF8", "#F472B6",
+  "#A3E635", "#FBBF24", "#67E8F9", "#F87171", "#34D399",
+];
+
+function chartColorAt(index) {
+  if (index < CHART_COLORS.length) return CHART_COLORS[index];
+  const hue = (index * 47) % 360;
+  const sat = 65 + (index % 3) * 8;
+  const light = 48 + (index % 4) * 5;
+  return `hsl(${hue}, ${sat}%, ${light}%)`;
+}
+
+function isFutureDate(dateStr) {
+  return dateStr > todayISO();
+}
 
 const TOP_INSET = Platform.OS === "android" ? StatusBar.currentHeight || 26 : 48;
 const BOTTOM_INSET = 28;
@@ -235,6 +292,7 @@ const STORAGE_KEYS = {
   USER: "@winnie_user_profile",
   GENDER: "@winnie_user_gender",
   SHEET_ID: "@winnie_sheet_id",
+  THEME: "@winnie_theme_mode",
 };
 
 export async function getStoredAuth() {
@@ -882,6 +940,13 @@ async function swapBuyItemsOrder(itemA, itemB) {
   await db.runAsync(`UPDATE buy_items SET sort_order = ? WHERE id = ?`, [orderA, itemB.id]);
   triggerTableSync("buy_items");
 }
+async function reorderBuyItems(orderedPending) {
+  const db = await getDb();
+  for (let i = 0; i < orderedPending.length; i++) {
+    await db.runAsync(`UPDATE buy_items SET sort_order = ? WHERE id = ?`, [i + 1, orderedPending[i].id]);
+  }
+  triggerTableSync("buy_items");
+}
 async function updateBuyItemOrder(id, newOrder) {
   const db = await getDb();
   await db.runAsync(`UPDATE buy_items SET sort_order = ? WHERE id = ?`, [newOrder, id]);
@@ -1034,7 +1099,16 @@ async function updateTask(id, { title, description, dueDate, dueTime, priority, 
 
 async function toggleTask(id) {
   const db = await getDb();
-  await db.runAsync(`UPDATE tasks SET completed = CASE WHEN completed = 0 THEN 1 ELSE 0 END WHERE id = ?`, [id]);
+  const task = await db.getFirstAsync(`SELECT * FROM tasks WHERE id = ?`, [id]);
+  if (!task) return;
+  if (task.completed === 0 && (task.repeat === "daily" || task.repeat === "day_by_day")) {
+    // When completing a daily repeating task, advance due date to tomorrow so it repeats day by day!
+    const baseDate = task.due_date >= todayISO() ? task.due_date : todayISO();
+    const nextDate = addDays(baseDate, 1);
+    await db.runAsync(`UPDATE tasks SET due_date = ?, completed = 0 WHERE id = ?`, [nextDate, id]);
+  } else {
+    await db.runAsync(`UPDATE tasks SET completed = CASE WHEN completed = 0 THEN 1 ELSE 0 END WHERE id = ?`, [id]);
+  }
   triggerTableSync("tasks");
 }
 
@@ -1195,6 +1269,14 @@ async function togglePeriodDay(date) {
   }
   triggerTableSync("period_days");
 }
+async function setMonthPeriodDays(monthPrefix, newDates) {
+  const db = await getDb();
+  await db.runAsync(`DELETE FROM period_days WHERE date LIKE ?`, [`${monthPrefix}%`]);
+  for (const d of newDates.slice(0, 5)) {
+    await db.runAsync(`INSERT INTO period_days (date) VALUES (?)`, [d]);
+  }
+  triggerTableSync("period_days");
+}
 
 // ───────────── GLOBAL APP CONTEXT ─────────────
 const AppContext = React.createContext({
@@ -1203,23 +1285,13 @@ const AppContext = React.createContext({
 });
 
 // ───────────── HEADER & MENU BUTTON ─────────────
-function ScreenHeader({ title, onMenuPress, iconKey, onProfilePress, userProfile }) {
+function ScreenHeader({ title, iconKey, onProfilePress, userProfile }) {
   const ctx = React.useContext(AppContext);
   const handleProfilePress = onProfilePress || ctx.openProfile;
   const profile = userProfile || ctx.userProfile;
 
   return (
     <View style={s.headerContainer}>
-      <TouchableOpacity
-        onPress={onMenuPress}
-        style={s.menuBtnInline}
-        hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}
-        activeOpacity={0.6}
-      >
-        <View style={s.menuLine} />
-        <View style={s.menuLine} />
-        <View style={s.menuLine} />
-      </TouchableOpacity>
       <View style={{ flex: 1, flexDirection: "row", alignItems: "center" }}>
         {iconKey && APP_ICONS[iconKey] && (
           <Image source={APP_ICONS[iconKey]} style={s.headerIcon} />
@@ -1487,7 +1559,12 @@ function WeekStreakBar({ selectedDate, setSelectedDate, weekDays, logsMap, total
             </Text>
           </View>
           <Pressable
-            onPress={() => setSelectedDate((prev) => addDays(prev, 7))}
+            onPress={() =>
+              setSelectedDate((prev) => {
+                const next = addDays(prev, 7);
+                return next > todayStr ? todayStr : next;
+              })
+            }
             hitSlop={12}
             disabled={selectedDate >= todayStr}
             style={{ opacity: selectedDate >= todayStr ? 0.3 : 1 }}
@@ -1505,12 +1582,17 @@ function WeekStreakBar({ selectedDate, setSelectedDate, weekDays, logsMap, total
           const dayNum = parseInt(d.split("-")[2], 10);
           const dayLabel = DAY_ABBR[index];
           const isAllDone = totalRituals > 0 && completedCount >= totalRituals;
+          const isFuture = d > todayStr;
 
           return (
             <Pressable
               key={d}
-              onPress={() => setSelectedDate(d)}
-              style={[s.weekStreakDayCol, isSelected && s.weekStreakTodayCol]}
+              onPress={() => {
+                if (isFuture) return;
+                setSelectedDate(d);
+              }}
+              disabled={isFuture}
+              style={[s.weekStreakDayCol, isSelected && s.weekStreakTodayCol, isFuture && { opacity: 0.35 }]}
             >
               <Text style={[s.weekStreakDayLabel, isSelected && { color: colors.streakOrange, fontWeight: "700" }]}>
                 {dayLabel}
@@ -1687,7 +1769,7 @@ function getGreeting() {
   return "Good evening 🌙";
 }
 
-function HomeScreen({ onMenuPress, onRitualTapped }) {
+function HomeScreen({ onRitualTapped }) {
   const todayStr = todayISO();
   const [selectedDate, setSelectedDate] = useState(todayISO());
   const weekDays = getWeekDaysForDate(selectedDate);
@@ -1713,6 +1795,7 @@ function HomeScreen({ onMenuPress, onRitualTapped }) {
   }, [loadData]);
 
   async function handleToggle(ritual) {
+    if (isFutureDate(selectedDate)) return;
     await toggleRitualLog(selectedDate, ritual.id);
     if (onRitualTapped) {
       onRitualTapped(ritual);
@@ -1735,7 +1818,7 @@ function HomeScreen({ onMenuPress, onRitualTapped }) {
 
   return (
     <View style={s.screen}>
-      <ScreenHeader title={getGreeting()} onMenuPress={onMenuPress} iconKey="home" />
+      <ScreenHeader title={getGreeting()} iconKey="home" />
       <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 30 + TAB_BAR_HEIGHT }}>
         {/* HERO BANNER WITH CHARACTER IMAGE */}
         <View style={s.bannerCard}>
@@ -1823,7 +1906,7 @@ function HomeScreen({ onMenuPress, onRitualTapped }) {
 }
 
 // ───────────── PROGRESS SCREEN ─────────────
-function ProgressScreen({ onMenuPress }) {
+function ProgressScreen() {
   const [streakStats, setStreakStats] = useState({ currentStreak: 0, highestStreak: 0, activeSet: new Set() });
   const [monthDate, setMonthDate] = useState(() => {
     const t = new Date();
@@ -1858,6 +1941,7 @@ function ProgressScreen({ onMenuPress }) {
   async function handleToggleDay(day) {
     if (!day) return;
     const dateStr = toISODate(new Date(year, month, day));
+    if (isFutureDate(dateStr)) return;
     const db = await getDb();
     const studyRitual = await db.getFirstAsync(
       `SELECT id FROM rituals WHERE LOWER(name) LIKE '%study%' LIMIT 1`
@@ -1892,7 +1976,7 @@ function ProgressScreen({ onMenuPress }) {
 
   return (
     <View style={s.screen}>
-      <ScreenHeader title="Progress" onMenuPress={onMenuPress} iconKey="progress" />
+      <ScreenHeader title="Progress" iconKey="progress" />
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -1987,13 +2071,14 @@ function ProgressScreen({ onMenuPress }) {
                 const dateStr = day ? toISODate(new Date(year, month, day)) : null;
                 const hasStreak = dateStr && activeSet.has(dateStr);
                 const isToday = dateStr === todayISO();
+                const isFuture = dateStr && isFutureDate(dateStr);
 
                 return (
                   <Pressable
                     key={i}
-                    disabled={!day}
+                    disabled={!day || isFuture}
                     onPress={() => handleToggleDay(day)}
-                    style={s.dayCell}
+                    style={[s.dayCell, isFuture && { opacity: 0.32 }]}
                   >
                     {day ? (
                       <View
@@ -2027,7 +2112,7 @@ function ProgressScreen({ onMenuPress }) {
                 <Text style={{ fontSize: 16 }}>🔥</Text>
                 <Text style={{ color: colors.textMuted, fontSize: 12 }}>Streak day</Text>
               </View>
-              <Text style={{ color: colors.textFaint, fontSize: 11 }}>Tap date to toggle study streak ⚡</Text>
+              <Text style={{ color: colors.textFaint, fontSize: 11 }}>Tap past or today to toggle · future dates stay locked ⚡</Text>
             </View>
           </View>
 
@@ -2103,7 +2188,7 @@ function ProgressScreen({ onMenuPress }) {
 }
 
 // ───────────── HEALTH SCREEN (PERIOD TRACKER) ─────────────
-function HealthScreen({ onMenuPress }) {
+function HealthScreen() {
   const [monthDate, setMonthDate] = useState(() => {
     const t = new Date();
     return new Date(t.getFullYear(), t.getMonth(), 1);
@@ -2126,17 +2211,22 @@ function HealthScreen({ onMenuPress }) {
   const month = monthDate.getMonth();
   const cells = getMonthGrid(year, month);
   const monthLabel = monthDate.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+  const monthPrefix = `${year}-${String(month + 1).padStart(2, "0")}`;
+  const monthMarkedCount = [...markedDays].filter((d) => d.startsWith(monthPrefix)).length;
 
   async function handleDayPress(day) {
     if (!day) return;
     const dateStr = toISODate(new Date(year, month, day));
+    const monthPrefix = `${year}-${String(month + 1).padStart(2, "0")}`;
+    const monthMarked = [...markedDays].filter((d) => d.startsWith(monthPrefix));
+
     if (markedDays.has(dateStr)) {
       await togglePeriodDay(dateStr);
+    } else if (monthMarked.length >= 5) {
+      Alert.alert("Period days", "You can select up to 5 dates in a month.");
+      return;
     } else {
-      for (let i = 0; i < 5; i++) {
-        const d = addDays(dateStr, i);
-        if (!markedDays.has(d)) await togglePeriodDay(d);
-      }
+      await togglePeriodDay(dateStr);
     }
     loadData();
   }
@@ -2145,7 +2235,7 @@ function HealthScreen({ onMenuPress }) {
 
   return (
     <View style={s.screen}>
-      <ScreenHeader title="Period Tracker" onMenuPress={onMenuPress} iconKey="health" />
+      <ScreenHeader title="Period Tracker" iconKey="health" />
       <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 40 + TAB_BAR_HEIGHT }}>
         {/* BANNER ART FOR PERIOD TRACKER */}
         <View style={s.bannerCard}>
@@ -2168,7 +2258,7 @@ function HealthScreen({ onMenuPress }) {
             </Pressable>
             <View style={{ alignItems: "center" }}>
               <Text style={s.monthLabel}>{monthLabel}</Text>
-              <Text style={s.dateSub}>Cycle Calendar 🗓️</Text>
+              <Text style={s.dateSub}>Select up to 5 days 🗓️</Text>
             </View>
             <Pressable onPress={() => setMonthDate(new Date(year, month + 1, 1))} hitSlop={12}>
               <Text style={s.arrow}>›</Text>
@@ -2187,14 +2277,14 @@ function HealthScreen({ onMenuPress }) {
             {cells.map((day, i) => {
               const dateStr = day ? toISODate(new Date(year, month, day)) : null;
               const marked = dateStr && markedDays.has(dateStr);
-              const isToday = dateStr === todayISO();
+              const atCap = !marked && monthMarkedCount >= 5;
 
               return (
                 <Pressable
                   key={i}
                   disabled={!day}
                   onPress={() => handleDayPress(day)}
-                  style={s.dayCell}
+                  style={[s.dayCell, atCap && { opacity: 0.35 }]}
                 >
                   {day ? (
                     <View
@@ -2309,9 +2399,8 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
       <Pressable style={s.modalBackdrop} onPress={onClose} />
       <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        style={s.sheetWrap}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 20 : 0}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={{ flex: 1, justifyContent: "flex-end" }}
         pointerEvents="box-none"
       >
         <ScrollView
@@ -2339,53 +2428,51 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
               </Pressable>
             </View>
 
-            <View style={{ flexShrink: 1 }}>
-              {/* ADD EXPENSE FORM SECTION */}
-              <Text style={s.label}>Category / Title 🏷️</Text>
-              <View style={s.quickEntryRow}>
-                <TagDropdown
-                  kind={entryType}
-                  value={category}
-                  onChange={(tag) => {
-                    setCategory(tag);
-                    setTitle(tag.name);
-                  }}
-                  accentColor={accent}
-                  placeholder="Search or add category"
-                  containerStyle={s.quickTitleInput}
-                />
-                <TextInput
-                  value={amount}
-                  onChangeText={setAmount}
-                  placeholder="Amount (₹)"
-                  placeholderTextColor={colors.textFaint}
-                  keyboardType="numeric"
-                  editable={breakdown.length === 0}
-                  style={[s.input, s.quickAmountInput, breakdown.length > 0 && { opacity: 0.6 }]}
-                />
-              </View>
-
-              {breakdown.length > 0 && <Text style={s.hint}>Auto-filled from breakdown below 🧮</Text>}
-
-              {/* BREAKDOWN SECTION */}
-              <Pressable onPress={() => setShowBreakdown((v) => !v)} style={{ marginTop: 10, marginBottom: 4 }}>
-                <Text style={{ color: accent, fontWeight: "600" }}>
-                  {showBreakdown ? "− Hide breakdown 📜" : "+ Add a breakdown 📋"}
-                </Text>
-              </Pressable>
-
-              {showBreakdown && (
-                <View style={s.breakdownBox}>
-                  <BreakdownTable items={breakdown} onChange={handleBreakdownChange} accentColor={accent} />
-                </View>
-              )}
+            {/* ADD EXPENSE FORM SECTION */}
+            <Text style={s.label}>Category / Title 🏷️</Text>
+            <View style={s.quickEntryRow}>
+              <TagDropdown
+                kind={entryType}
+                value={category}
+                onChange={(tag) => {
+                  setCategory(tag);
+                  setTitle(tag.name);
+                }}
+                accentColor={accent}
+                placeholder="Search or add category"
+                containerStyle={s.quickTitleInput}
+              />
+              <TextInput
+                value={amount}
+                onChangeText={setAmount}
+                placeholder="Amount (₹)"
+                placeholderTextColor={colors.textFaint}
+                keyboardType="numeric"
+                editable={breakdown.length === 0}
+                style={[s.input, s.quickAmountInput, breakdown.length > 0 && { opacity: 0.6 }]}
+              />
             </View>
 
-            {/* SAVE BUTTON AT THE BOTTOM VISIBLE IN A SINGLE GO */}
+            {breakdown.length > 0 && <Text style={s.hint}>Auto-filled from breakdown below 🧮</Text>}
+
+            {/* BREAKDOWN SECTION */}
+            <Pressable onPress={() => setShowBreakdown((v) => !v)} style={{ marginTop: 10, marginBottom: 4 }}>
+              <Text style={{ color: accent, fontWeight: "600" }}>
+                {showBreakdown ? "− Hide breakdown 📜" : "+ Add a breakdown 📋"}
+              </Text>
+            </Pressable>
+
+            {showBreakdown && (
+              <View style={s.breakdownBox}>
+                <BreakdownTable items={breakdown} onChange={handleBreakdownChange} accentColor={accent} />
+              </View>
+            )}
+
+            {/* SAVE BUTTON */}
             <Pressable
               onPress={handleSave}
               disabled={saving}
-              style={[s.saveBtn, { backgroundColor: accent, opacity: saving ? 0.6 : 1, marginTop: 12 }]}
+              style={[s.saveBtn, { backgroundColor: accent, opacity: saving ? 0.6 : 1, marginTop: 14 }]}
             >
               <Text style={s.saveBtnText}>{isEditing ? "Update Entry 🔄" : "Save Entry 💾"}</Text>
             </Pressable>
@@ -2396,41 +2483,72 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
   );
 }
 
-// ───────────── ENTRY CARD & SWIPEABLE ROW ─────────────
 function SwipeableRow({ onSwipeDelete, children }) {
   const translateX = useRef(new Animated.Value(0)).current;
+
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => false,
-      onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 12 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5,
+      onStartShouldSetPanResponderCapture: () => false,
+      onMoveShouldSetPanResponder: (_, g) => {
+        // Capture horizontal movements that are clearly intentional
+        return Math.abs(g.dx) > 10 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5;
+      },
+      onMoveShouldSetPanResponderCapture: () => false,
+      onPanResponderGrant: () => {
+        translateX.setOffset(0);
+      },
       onPanResponderMove: (_, g) => {
-        translateX.setValue(Math.max(0, Math.min(g.dx, 110)));
+        // Smoothly follow finger in either direction, clamped to max 130px
+        const clamped = Math.max(-130, Math.min(130, g.dx));
+        translateX.setValue(clamped);
       },
       onPanResponderRelease: (_, g) => {
-        if (g.dx > 80) {
-          Animated.timing(translateX, { toValue: 500, duration: 180, useNativeDriver: true }).start(() => {
+        translateX.flattenOffset();
+        const swipedLeft = g.dx < -65 || (g.dx < -30 && g.vx < -0.3);
+        const swipedRight = g.dx > 65 || (g.dx > 30 && g.vx > 0.3);
+
+        if (swipedLeft || swipedRight) {
+          // Animate smoothly off-screen in the swiped direction
+          const targetValue = swipedLeft ? -400 : 400;
+          Animated.timing(translateX, {
+            toValue: targetValue,
+            duration: 180,
+            useNativeDriver: true,
+          }).start(() => {
             onSwipeDelete();
+            translateX.setValue(0);
           });
         } else {
-          Animated.spring(translateX, { toValue: 0, useNativeDriver: true, bounciness: 6 }).start();
+          // Snap back smoothly
+          Animated.spring(translateX, {
+            toValue: 0,
+            useNativeDriver: true,
+            bounciness: 4,
+            speed: 16,
+          }).start();
         }
       },
       onPanResponderTerminate: () => {
-        Animated.spring(translateX, { toValue: 0, useNativeDriver: true }).start();
+        translateX.flattenOffset();
+        Animated.spring(translateX, { toValue: 0, useNativeDriver: true, bounciness: 2 }).start();
       },
     })
   ).current;
 
   const backdropOpacity = translateX.interpolate({
-    inputRange: [0, 80],
-    outputRange: [0, 1],
+    inputRange: [-80, -20, 0, 20, 80],
+    outputRange: [1, 0.5, 0, 0.5, 1],
     extrapolate: "clamp",
   });
 
   return (
     <View style={s.swipeWrap}>
       <Animated.View style={[s.swipeBackdrop, { opacity: backdropOpacity }]}>
-        <Text style={s.swipeDeleteLabel}>Delete 🗑️</Text>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 16, width: "100%" }}>
+          <Text style={s.swipeDeleteLabel}>🗑️ Delete</Text>
+          <Text style={s.swipeDeleteLabel}>🗑️ Delete</Text>
+        </View>
       </Animated.View>
       <Animated.View style={{ transform: [{ translateX }] }} {...panResponder.panHandlers}>
         {children}
@@ -2535,7 +2653,7 @@ function EntryCard({ entry, onDeleted, onEdit, interactive = true, showDate = fa
 }
 
 // ───────────── EXPENSES SCREEN ─────────────
-function ExpensesScreen({ focusKey, onMenuPress }) {
+function ExpensesScreen({ focusKey }) {
   const [date, setDate] = useState(todayISO());
   const [entries, setEntries] = useState([]);
   const [carriedForward, setCarriedForward] = useState(0);
@@ -2572,7 +2690,7 @@ function ExpensesScreen({ focusKey, onMenuPress }) {
 
   return (
     <View style={s.screen}>
-      <ScreenHeader title="Expenses" onMenuPress={onMenuPress} iconKey="expenses" />
+      <ScreenHeader title="Expenses" iconKey="expenses" />
       <FlatList
         data={entries}
         keyExtractor={(item) => String(item.id)}
@@ -2659,36 +2777,151 @@ function DonutChart({ rows, colorsForRows }) {
   const total = rows.reduce((sum, row) => sum + row.total, 0);
   const radius = 52;
   const circumference = 2 * Math.PI * radius;
-  let completed = 0;
+  const GAP_DEG = rows.length > 1 ? 2.5 : 0; // distinct gap between each segment
+  const gapLength = (GAP_DEG / 360) * circumference;
+  const [selectedIdx, setSelectedIdx] = useState(null);
+
+  // Progressive loading animation: chart segments fill up smoothly from 0 to 100%
+  const [loadProgress, setLoadProgress] = useState(0);
+
+  useEffect(() => {
+    setLoadProgress(0);
+    let start = null;
+    let animId;
+    const duration = 750; // smooth 750ms loading fill
+
+    const step = (timestamp) => {
+      if (!start) start = timestamp;
+      const progress = Math.min(1, (timestamp - start) / duration);
+      // easeOutCubic curve
+      const eased = 1 - Math.pow(1 - progress, 3);
+      setLoadProgress(eased);
+      if (progress < 1) {
+        animId = requestAnimationFrame(step);
+      }
+    };
+    animId = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(animId);
+  }, [rows]);
+
+  // Build segments with gap subtracted so slices never touch or bleed
+  const segments = rows.map((row) => {
+    const fraction = total ? row.total / total : 0;
+    const sliceLength = fraction * circumference;
+    const animatedSlice = sliceLength * loadProgress;
+    const drawnLength = Math.max(0, animatedSlice - (loadProgress > 0.4 ? gapLength : 0));
+    return { ...row, fraction, sliceLength: animatedSlice, drawnLength };
+  });
+
+  let cumulativeOffset = 0;
+  const selectedRow = selectedIdx !== null ? rows[selectedIdx] : null;
+  const selectedPct = selectedRow && total ? ((selectedRow.total / total) * 100).toFixed(1) : null;
+  const animatedTotal = Math.round(total * loadProgress);
+
   return (
-    <View style={s.donutWrap}>
-      <Svg width={142} height={142} viewBox="0 0 142 142">
-        <Circle cx="71" cy="71" r={radius} stroke={colors.bg} strokeWidth="22" fill="none" />
+    <View style={{ alignItems: "center" }}>
+      <View style={s.donutWrap}>
+        <Svg width={170} height={170} viewBox="0 0 142 142">
+          {/* Background track ring */}
+          <Circle cx="71" cy="71" r={radius} stroke={colors.surfaceRaised} strokeWidth="22" fill="none" />
+          {segments.map((seg, index) => {
+            const offset = -cumulativeOffset;
+            cumulativeOffset += seg.sliceLength;
+            const isSelected = selectedIdx === index;
+            const strokeColor = chartColorAt(index);
+            return (
+              <Circle
+                key={seg.category}
+                cx="71"
+                cy="71"
+                r={radius}
+                stroke={strokeColor}
+                strokeWidth={isSelected ? 26 : 20}
+                fill="none"
+                strokeDasharray={`${seg.drawnLength} ${circumference}`}
+                strokeDashoffset={offset}
+                strokeLinecap={loadProgress > 0.9 ? "round" : "butt"}
+                rotation="-90"
+                origin="71,71"
+                opacity={selectedIdx === null || isSelected ? 1 : 0.35}
+              />
+            );
+          })}
+        </Svg>
+
+        {/* Center info */}
+        <Pressable style={s.donutCenter} onPress={() => setSelectedIdx(null)}>
+          {selectedRow ? (
+            <View style={{ alignItems: "center", paddingHorizontal: 12 }}>
+              <Text
+                style={{
+                  fontSize: 12,
+                  fontWeight: "800",
+                  color: chartColorAt(selectedIdx),
+                  textAlign: "center",
+                }}
+                numberOfLines={1}
+              >
+                {selectedRow.category}
+              </Text>
+              <Text style={[s.donutTotal, { fontSize: 16, marginTop: 2 }]}>
+                ₹{selectedRow.total.toFixed(0)}
+              </Text>
+              <Text style={[s.donutCaption, { color: colors.textMuted, fontSize: 11, fontWeight: "700" }]}>
+                {selectedPct}% of total
+              </Text>
+            </View>
+          ) : (
+            <View style={{ alignItems: "center" }}>
+              <Text style={{ fontSize: 14 }}>📊</Text>
+              <Text style={[s.donutTotal, { fontSize: 18, marginTop: 1 }]}>
+                ₹{animatedTotal.toLocaleString("en-IN")}
+              </Text>
+              <Text style={[s.donutCaption, { color: colors.textMuted, fontSize: 10 }]}>Total Spent</Text>
+            </View>
+          )}
+        </Pressable>
+      </View>
+
+      {/* Interactive Legend with amount & % share */}
+      <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 8, marginTop: 14, width: "100%" }}>
         {rows.map((row, index) => {
-          const length = total ? (row.total / total) * circumference : 0;
-          const segment = (
-            <Circle
+          const color = chartColorAt(index);
+          const isSelected = selectedIdx === index;
+          const sharePct = total ? ((row.total / total) * 100).toFixed(0) : 0;
+          return (
+            <Pressable
               key={row.category}
-              cx="71"
-              cy="71"
-              r={radius}
-              stroke={colorsForRows[index % colorsForRows.length]}
-              strokeWidth="22"
-              fill="none"
-              strokeDasharray={`${length} ${circumference - length}`}
-              strokeDashoffset={-completed}
-              strokeLinecap="butt"
-              rotation="-90"
-              origin="71,71"
-            />
+              onPress={() => setSelectedIdx(isSelected ? null : index)}
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 6,
+                paddingHorizontal: 10,
+                paddingVertical: 6,
+                borderRadius: 14,
+                backgroundColor: isSelected ? color + "25" : colors.surface,
+                borderWidth: 1.5,
+                borderColor: isSelected ? color : colors.border,
+              }}
+            >
+              <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: color }} />
+              <Text
+                style={{
+                  color: isSelected ? colors.text : colors.textMuted,
+                  fontSize: 12,
+                  fontWeight: isSelected ? "700" : "500",
+                }}
+                numberOfLines={1}
+              >
+                {row.category}
+              </Text>
+              <Text style={{ color, fontSize: 11, fontWeight: "800" }}>
+                ₹{row.total.toFixed(0)} ({sharePct}%)
+              </Text>
+            </Pressable>
           );
-          completed += length;
-          return segment;
         })}
-      </Svg>
-      <View style={s.donutCenter}>
-        <Text style={s.donutTotal}>₹{total.toFixed(0)}</Text>
-        <Text style={s.donutCaption}>spent 📊</Text>
       </View>
     </View>
   );
@@ -2787,24 +3020,12 @@ function RitualReportCalendar({ ritual, monthDate, onToggleDay }) {
   );
 }
 
-function ExpenseReportsScreen({ onMenuPress }) {
+function ExpenseReportsScreen() {
   const [month, setMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [rows, setRows] = useState([]);
   const [rituals, setRituals] = useState([]);
   const [summary, setSummary] = useState({ income: 0, expense: 0 });
   const [loading, setLoading] = useState(true);
-  const chartColors = [
-    "#6366F1", // Indigo
-    "#10B981", // Emerald
-    "#F59E0B", // Amber
-    "#EC4899", // Pink
-    "#06B6D4", // Cyan
-    "#8B5CF6", // Purple
-    "#F97316", // Orange
-    "#14B8A6", // Teal
-    "#3B82F6", // Blue
-    "#E11D48", // Crimson
-  ];
 
   const spinAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -2865,7 +3086,7 @@ function ExpenseReportsScreen({ onMenuPress }) {
 
   return (
     <View style={s.screen}>
-      <ScreenHeader title="Reports" onMenuPress={onMenuPress} iconKey="reports" />
+      <ScreenHeader title="Reports" iconKey="reports" />
       <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 30 + TAB_BAR_HEIGHT }}>
         {/* HERO BANNER FOR REPORTS */}
         <View style={s.bannerCard}>
@@ -2954,7 +3175,7 @@ function ExpenseReportsScreen({ onMenuPress }) {
                         s.barFill,
                         {
                           width: `${(row.total / max) * 100}%`,
-                          backgroundColor: chartColors[index % chartColors.length],
+                          backgroundColor: chartColorAt(index),
                         },
                       ]}
                     />
@@ -2966,7 +3187,7 @@ function ExpenseReportsScreen({ onMenuPress }) {
 
             <Text style={s.listLabel}>Share of Spending 🍩</Text>
             <View style={[s.reportCard, cardShadow]}>
-              <DonutChart rows={rows} colorsForRows={chartColors} />
+              <DonutChart rows={rows} colorsForRows={CHART_COLORS} />
             </View>
 
             {/* RITUAL CONSISTENCY REPORT SECTION */}
@@ -2982,7 +3203,7 @@ function ExpenseReportsScreen({ onMenuPress }) {
 }
 
 // ───────────── BUY SCREEN ─────────────
-function BuyScreen({ onMenuPress }) {
+function BuyScreen() {
   const [items, setItems] = useState([]);
   const [newItem, setNewItem] = useState("");
   const [newPriceMin, setNewPriceMin] = useState("");
@@ -3028,105 +3249,175 @@ function BuyScreen({ onMenuPress }) {
     loadData();
   }
 
-  function getAffordStatus(item) {
-    const min = item.price_min || 0;
-    const max = item.price_max || 0;
-    if (!max && !min) return "none";
-    if (currentBalance >= max && max > 0) return "green";
-    if (currentBalance < min) return "red";
-    return "yellow";
+  // Cumulative Priority Budgeting: higher priority items consume the balance first!
+  const affordMap = new Map();
+  let remainingBudget = currentBalance;
+  for (const item of pendingItems) {
+    const cost = item.price_max > 0 ? item.price_max : item.price_min > 0 ? item.price_min : 0;
+    if (cost === 0) {
+      affordMap.set(item.id, "none");
+    } else if (remainingBudget >= cost) {
+      affordMap.set(item.id, "green");
+      remainingBudget -= cost;
+    } else if (item.price_min > 0 && remainingBudget >= item.price_min) {
+      affordMap.set(item.id, "yellow");
+      remainingBudget = Math.max(0, remainingBudget - item.price_min);
+    } else {
+      // Prior items in queue used up the budget! Even if within original balance, it's red here!
+      affordMap.set(item.id, "red");
+    }
   }
 
-  const balanceColor = currentBalance >= 0 ? colors.positive : colors.negative;
+  function GlidableBuyCard({ item, realIndex, isCompleted, onMoveItem, onToggleItem, onDeleteItem }) {
+    const translateY = useRef(new Animated.Value(0)).current;
+    const [isGliding, setIsGliding] = useState(false);
+    const lastMovedOffset = useRef(0);
 
-  const pendingItems = items.filter((i) => !i.completed);
-  const doneItems = items.filter((i) => i.completed);
+    const glideResponder = useRef(
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: () => {
+          setIsGliding(true);
+          lastMovedOffset.current = 0;
+        },
+        onPanResponderMove: (_, g) => {
+          translateY.setValue(g.dy);
+          // If dragged down past ~42px, move down in priority
+          if (g.dy - lastMovedOffset.current > 42) {
+            onMoveItem(realIndex, 1);
+            lastMovedOffset.current = g.dy;
+          }
+          // If dragged up past -42px, move up in priority
+          else if (g.dy - lastMovedOffset.current < -42) {
+            onMoveItem(realIndex, -1);
+            lastMovedOffset.current = g.dy;
+          }
+        },
+        onPanResponderRelease: () => {
+          setIsGliding(false);
+          Animated.spring(translateY, { toValue: 0, useNativeDriver: true, bounciness: 4 }).start();
+        },
+        onPanResponderTerminate: () => {
+          setIsGliding(false);
+          Animated.spring(translateY, { toValue: 0, useNativeDriver: true }).start();
+        },
+      })
+    ).current;
 
-  function renderItem(item, index, allItems) {
-    const status = getAffordStatus(item);
-    const dotColor = status === "green" ? "#22C55E" : status === "red" ? "#EF4444" : status === "yellow" ? "#FBBF24" : colors.textFaint;
-    const borderColor = status === "green" ? "#22C55E40" : status === "red" ? "#EF444440" : colors.border;
+    const status = isCompleted ? "none" : (affordMap.get(item.id) || "none");
+    const borderColor = status === "green" ? "#22C55E50" : status === "red" ? "#EF444450" : status === "yellow" ? "#FBBF2450" : colors.border;
     const textColor = status === "green" ? "#22C55E" : status === "red" ? "#EF4444" : status === "yellow" ? "#FBBF24" : colors.text;
-    const realIndex = items.indexOf(item);
 
     return (
-      <View
-        key={item.id}
+      <Animated.View
         style={{
-          flexDirection: "row",
-          alignItems: "center",
-          backgroundColor: colors.surface,
-          borderRadius: 14,
-          padding: 12,
+          transform: [{ translateY }, { scale: isGliding ? 1.02 : 1 }],
+          zIndex: isGliding ? 999 : 1,
           marginBottom: 8,
-          borderWidth: 1,
-          borderColor,
-          gap: 10,
         }}
       >
-        {/* Priority handle: up/down arrows */}
-        {!item.completed && (
-          <View style={{ alignItems: "center", gap: 1 }}>
-            <Pressable onPress={() => moveItem(realIndex, -1)} hitSlop={8}
-              style={{ opacity: realIndex === 0 ? 0.2 : 1 }}>
-              <Text style={{ color: colors.textFaint, fontSize: 13, lineHeight: 16 }}>▲</Text>
+        <SwipeableRow onSwipeDelete={() => onDeleteItem(item.id)}>
+          <View
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              backgroundColor: isGliding ? colors.surfaceHighlight : colors.surface,
+              borderRadius: 14,
+              paddingVertical: 10,
+              paddingHorizontal: 12,
+              borderWidth: 1.5,
+              borderColor: isGliding ? colors.streakOrange : borderColor,
+              gap: 8,
+              elevation: isGliding ? 8 : 0,
+              shadowColor: "#000",
+              shadowOffset: { width: 0, height: isGliding ? 6 : 0 },
+              shadowOpacity: isGliding ? 0.35 : 0,
+              shadowRadius: isGliding ? 10 : 0,
+            }}
+          >
+            {/* Spotify-style Glide Handle */}
+            {!isCompleted && (
+              <View
+                {...glideResponder.panHandlers}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                style={{
+                  paddingVertical: 8,
+                  paddingHorizontal: 6,
+                  justifyContent: "center",
+                  alignItems: "center",
+                }}
+              >
+                <Text
+                  style={{
+                    color: isGliding ? colors.streakOrange : colors.textMuted,
+                    fontSize: 22,
+                    fontWeight: "900",
+                    lineHeight: 22,
+                    letterSpacing: -1,
+                  }}
+                >
+                  ≡
+                </Text>
+              </View>
+            )}
+
+            {/* Item Info */}
+            <View style={{ flex: 1 }}>
+              <Text
+                style={{
+                  color: isCompleted ? colors.textFaint : textColor,
+                  fontSize: 14,
+                  fontWeight: "700",
+                  textDecorationLine: isCompleted ? "line-through" : "none",
+                }}
+              >
+                {item.title}
+              </Text>
+              {(item.price_min > 0 || item.price_max > 0) && (
+                <Text style={{ color: colors.textFaint, fontSize: 11, marginTop: 2, fontWeight: "600" }}>
+                  {item.price_min > 0 && item.price_max > 0
+                    ? `₹${item.price_min} – ₹${item.price_max}`
+                    : item.price_max > 0
+                    ? `Up to ₹${item.price_max}`
+                    : `From ₹${item.price_min}`}
+                </Text>
+              )}
+            </View>
+
+            {/* Affordability Badge Indicator */}
+            {status !== "none" && (
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 3 }}>
+                <Text style={{ fontSize: 14 }}>
+                  {status === "green" ? "🟢" : status === "red" ? "🔴" : "🟡"}
+                </Text>
+                {status === "red" && (
+                  <Text style={{ color: colors.negative, fontSize: 10, fontWeight: "700" }}>Out of budget</Text>
+                )}
+              </View>
+            )}
+
+            {/* Checkbox */}
+            <Pressable
+              onPress={() => onToggleItem(item.id)}
+              style={[s.buyCheckbox, isCompleted && s.buyCheckboxCompleted]}
+            >
+              {isCompleted && <Text style={s.buyCheckmark}>✓</Text>}
             </Pressable>
-            <View style={{ width: 18, height: 3, backgroundColor: colors.border, borderRadius: 2 }} />
-            <View style={{ width: 18, height: 3, backgroundColor: colors.border, borderRadius: 2 }} />
-            <Pressable onPress={() => moveItem(realIndex, 1)} hitSlop={8}
-              style={{ opacity: realIndex === pendingItems.length - 1 ? 0.2 : 1 }}>
-              <Text style={{ color: colors.textFaint, fontSize: 13, lineHeight: 16 }}>▼</Text>
+
+            {/* Delete button */}
+            <Pressable onPress={() => onDeleteItem(item.id)} hitSlop={10}>
+              <Text style={s.entryDeleteX}>×</Text>
             </Pressable>
           </View>
-        )}
-
-        {/* Item info */}
-        <View style={{ flex: 1 }}>
-          <Text style={{
-            color: item.completed ? colors.textFaint : textColor,
-            fontSize: 14,
-            fontWeight: "600",
-            textDecorationLine: item.completed ? "line-through" : "none",
-          }}>
-            {item.title}
-          </Text>
-          {(item.price_min > 0 || item.price_max > 0) && (
-            <Text style={{ color: colors.textFaint, fontSize: 11, marginTop: 2 }}>
-              {item.price_min > 0 && item.price_max > 0
-                ? `₹${item.price_min} – ₹${item.price_max}`
-                : item.price_max > 0
-                ? `Up to ₹${item.price_max}`
-                : `From ₹${item.price_min}`}
-            </Text>
-          )}
-        </View>
-
-        {/* Affordability badge */}
-        {status !== "none" && (
-          <Text style={{ fontSize: 16 }}>
-            {status === "green" ? "🟢" : status === "red" ? "🔴" : "🟡"}
-          </Text>
-        )}
-
-        {/* Checkbox */}
-        <Pressable
-          onPress={() => handleToggle(item.id)}
-          style={[s.buyCheckbox, item.completed && s.buyCheckboxCompleted]}
-        >
-          {item.completed && <Text style={s.buyCheckmark}>✓</Text>}
-        </Pressable>
-
-        {/* Delete */}
-        <Pressable onPress={() => handleDelete(item.id)} hitSlop={8}>
-          <Text style={s.entryDeleteX}>×</Text>
-        </Pressable>
-      </View>
+        </SwipeableRow>
+      </Animated.View>
     );
   }
 
   return (
     <View style={s.screen}>
-      <ScreenHeader title="Buy List 🛒" onMenuPress={onMenuPress} iconKey="buy" />
+      <ScreenHeader title="Buy List 🛒" iconKey="buy" />
 
       <ScrollView
         contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 100 + TAB_BAR_HEIGHT }}
@@ -3142,24 +3433,44 @@ function BuyScreen({ onMenuPress }) {
               </Text>
             </View>
             <View style={{ alignItems: "flex-end", gap: 4 }}>
-              <Text style={{ color: colors.textFaint, fontSize: 10 }}>🟢 Can afford</Text>
-              <Text style={{ color: colors.textFaint, fontSize: 10 }}>🟡 Partial range</Text>
-              <Text style={{ color: colors.textFaint, fontSize: 10 }}>🔴 Out of budget</Text>
+              <Text style={{ color: colors.positive, fontSize: 10, fontWeight: "700" }}>🟢 Can afford</Text>
+              <Text style={{ color: colors.streakGold, fontSize: 10, fontWeight: "700" }}>🟡 Partial range</Text>
+              <Text style={{ color: colors.negative, fontSize: 10, fontWeight: "700" }}>🔴 Priority depleted</Text>
             </View>
           </View>
         </View>
 
         {/* Pending items */}
         {pendingItems.length > 0 && (
-          <Text style={[s.listLabel, { marginTop: 14 }]}>Priority Queue 📋 · drag to reorder</Text>
+          <Text style={[s.listLabel, { marginTop: 14 }]}>Priority Queue 📋 · glide ≡ to reorder</Text>
         )}
-        {pendingItems.map((item, idx) => renderItem(item, idx, pendingItems))}
+        {pendingItems.map((item, idx) => (
+          <GlidableBuyCard
+            key={item.id}
+            item={item}
+            realIndex={items.indexOf(item)}
+            isCompleted={false}
+            onMoveItem={moveItem}
+            onToggleItem={handleToggle}
+            onDeleteItem={handleDelete}
+          />
+        ))}
 
         {/* Done items */}
         {doneItems.length > 0 && (
           <>
             <Text style={[s.listLabel, { marginTop: 14 }]}>Done ✅</Text>
-            {doneItems.map((item, idx) => renderItem(item, idx, doneItems))}
+            {doneItems.map((item, idx) => (
+              <GlidableBuyCard
+                key={item.id}
+                item={item}
+                realIndex={items.indexOf(item)}
+                isCompleted={true}
+                onMoveItem={moveItem}
+                onToggleItem={handleToggle}
+                onDeleteItem={handleDelete}
+              />
+            ))}
           </>
         )}
 
@@ -3245,7 +3556,7 @@ const PRESET_AVATARS = [
 ];
 
 // ───────────── PROFILE & SETTINGS MODAL ─────────────
-function ProfileModal({ visible, onClose, authData, onUpdateUser, onSignOut }) {
+function ProfileModal({ visible, onClose, authData, onUpdateUser, onSignOut, themeMode, onToggleTheme }) {
   const user = authData?.user || { name: "Friend", email: "" };
   const [activeTab, setActiveTab] = useState("avatar");
   const [customUrl, setCustomUrl] = useState("");
@@ -3437,6 +3748,16 @@ function TaskEditorModal({ visible, task, onClose, onSaved }) {
   const [category, setCategory] = useState("General");
   const [repeat, setRepeat] = useState("none");
   const [saving, setSaving] = useState(false);
+  const [showCalendar, setShowCalendar] = useState(false);
+  const [showTimePicker, setShowTimePicker] = useState(false);
+  // Calendar navigation month
+  const [calMonth, setCalMonth] = useState(() => {
+    const t = new Date();
+    return new Date(t.getFullYear(), t.getMonth(), 1);
+  });
+  // Time picker drum state
+  const [pickerHour, setPickerHour] = useState(9);
+  const [pickerMinute, setPickerMinute] = useState(0);
 
   useEffect(() => {
     if (visible) {
@@ -3457,6 +3778,8 @@ function TaskEditorModal({ visible, task, onClose, onSaved }) {
         setCategory("General");
         setRepeat("none");
       }
+      setShowCalendar(false);
+      setShowTimePicker(false);
     }
   }, [visible, task]);
 
@@ -3493,6 +3816,27 @@ function TaskEditorModal({ visible, task, onClose, onSaved }) {
     }
   }
 
+  // Calendar helpers
+  const calYear = calMonth.getFullYear();
+  const calMonthIdx = calMonth.getMonth();
+  const calCells = getMonthGrid(calYear, calMonthIdx);
+  const calLabel = calMonth.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+
+  function selectCalDate(day) {
+    if (!day) return;
+    const d = new Date(calYear, calMonthIdx, day);
+    setDueDate(toISODate(d));
+    setShowCalendar(false);
+  }
+
+  // Time picker confirm
+  function confirmTime() {
+    const hh = String(pickerHour).padStart(2, "0");
+    const mm = String(pickerMinute).padStart(2, "0");
+    setDueTime(`${hh}:${mm}`);
+    setShowTimePicker(false);
+  }
+
   const CATEGORIES = ["General", "Work", "Personal", "Health", "Shopping"];
   const PRIORITIES = [
     { key: "high", label: "High 🔴", color: colors.negative },
@@ -3506,14 +3850,18 @@ function TaskEditorModal({ visible, task, onClose, onSaved }) {
     { label: "Next Week", date: addDays(todayISO(), 7) },
   ];
   const TIME_PRESETS = ["09:00", "13:00", "18:00", "21:00"];
+  const REPEAT_OPTIONS = [
+    { key: "none", label: "Do Not Repeat" },
+    { key: "daily", label: "Day by Day (Daily) 🔁" },
+    { key: "weekly", label: "Every Week 📅" },
+  ];
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
       <Pressable style={s.modalBackdrop} onPress={onClose} />
       <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        style={s.sheetWrap}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 20 : 0}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={{ flex: 1, justifyContent: "flex-end" }}
         pointerEvents="box-none"
       >
         <ScrollView
@@ -3522,10 +3870,9 @@ function TaskEditorModal({ visible, task, onClose, onSaved }) {
           showsVerticalScrollIndicator={false}
           bounces={false}
         >
-          <View style={[s.sheetCompact, { maxHeight: "90%" }]}>
+          <View style={s.sheetCompact}>
             <View style={s.grabber} />
             <Text style={s.modalHeaderTitle}>{task ? "Edit Task / Reminder ✏️" : "New Task & Reminder ⏰"}</Text>
-
             <Text style={[s.label, { marginTop: 0 }]}>Task Title *</Text>
             <TextInput
               value={title}
@@ -3536,61 +3883,237 @@ function TaskEditorModal({ visible, task, onClose, onSaved }) {
               autoFocus={!task}
             />
 
-            
-
             {/* Due Date */}
             <Text style={s.label}>Due Date 📅</Text>
             <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
               {DATE_PRESETS.map((p) => (
                 <TouchableOpacity
                   key={p.label}
-                  onPress={() => setDueDate(p.date)}
+                  onPress={() => { setDueDate(p.date); setShowCalendar(false); }}
                   style={[s.presetPill, dueDate === p.date && s.presetPillActive]}
                 >
                   <Text style={[s.presetPillText, dueDate === p.date && s.presetPillTextActive]}>{p.label}</Text>
                 </TouchableOpacity>
               ))}
             </View>
-            <TextInput
-              value={dueDate}
-              onChangeText={setDueDate}
-              placeholder="YYYY-MM-DD"
-              placeholderTextColor={colors.textFaint}
-              style={s.input}
-            />
+            {/* Date input + calendar icon */}
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <TextInput
+                value={dueDate}
+                onChangeText={setDueDate}
+                placeholder="YYYY-MM-DD"
+                placeholderTextColor={colors.textFaint}
+                style={[s.input, { flex: 1, marginBottom: 0 }]}
+              />
+              <TouchableOpacity
+                onPress={() => {
+                  // Navigate calendar to the selected date's month
+                  const parts = dueDate.split("-");
+                  if (parts.length === 3) {
+                    setCalMonth(new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, 1));
+                  }
+                  setShowCalendar((v) => !v);
+                  setShowTimePicker(false);
+                }}
+                style={{
+                  width: 42, height: 42,
+                  backgroundColor: showCalendar ? "#38BDF8" : colors.surface,
+                  borderRadius: 10, borderWidth: 1,
+                  borderColor: showCalendar ? "#38BDF8" : colors.border,
+                  alignItems: "center", justifyContent: "center",
+                }}
+              >
+                <Text style={{ fontSize: 20 }}>📅</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Inline Calendar Picker */}
+            {showCalendar && (
+              <View style={{
+                backgroundColor: colors.surface, borderRadius: 14,
+                padding: 12, marginTop: 8,
+                borderWidth: 1, borderColor: colors.border,
+              }}>
+                {/* Month navigation */}
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                  <TouchableOpacity onPress={() => setCalMonth(new Date(calYear, calMonthIdx - 1, 1))} hitSlop={12}>
+                    <Text style={[s.arrow, { fontSize: 20 }]}>‹</Text>
+                  </TouchableOpacity>
+                  <Text style={{ color: colors.text, fontWeight: "700", fontSize: 14 }}>{calLabel}</Text>
+                  <TouchableOpacity onPress={() => setCalMonth(new Date(calYear, calMonthIdx + 1, 1))} hitSlop={12}>
+                    <Text style={[s.arrow, { fontSize: 20 }]}>›</Text>
+                  </TouchableOpacity>
+                </View>
+                {/* Day labels */}
+                <View style={s.weekRow}>
+                  {["S","M","T","W","T","F","S"].map((d, i) => (
+                    <Text key={i} style={s.weekLabel}>{d}</Text>
+                  ))}
+                </View>
+                {/* Day grid */}
+                <View style={s.calendarGrid}>
+                  {calCells.map((day, i) => {
+                    const dateStr = day ? toISODate(new Date(calYear, calMonthIdx, day)) : null;
+                    const isSelected = dateStr === dueDate;
+                    const isToday = dateStr === todayISO();
+                    return (
+                      <Pressable key={i} disabled={!day} onPress={() => selectCalDate(day)} style={s.dayCell}>
+                        {day ? (
+                          <View style={[
+                            s.dayCircleRound,
+                            isSelected && { backgroundColor: "#38BDF8" },
+                            isToday && !isSelected && s.todayCalendarBorder,
+                          ]}>
+                            <Text style={[s.dayText, isSelected && { color: "#000", fontWeight: "700" }]}>{day}</Text>
+                          </View>
+                        ) : null}
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+            )}
 
             {/* Due Time */}
-            <Text style={s.label}>Due Time ⏰</Text>
+            <Text style={[s.label, { marginTop: 12 }]}>Due Time ⏰</Text>
             <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
               {TIME_PRESETS.map((t) => (
                 <TouchableOpacity
                   key={t}
-                  onPress={() => setDueTime(t)}
+                  onPress={() => { setDueTime(t); setShowTimePicker(false); }}
                   style={[s.presetPill, dueTime === t && s.presetPillActive]}
                 >
                   <Text style={[s.presetPillText, dueTime === t && s.presetPillTextActive]}>{t}</Text>
                 </TouchableOpacity>
               ))}
             </View>
-            <TextInput
-              value={dueTime}
-              onChangeText={setDueTime}
-              placeholder="HH:mm (e.g. 14:30)"
-              placeholderTextColor={colors.textFaint}
-              style={s.input}
-            />
+            {/* Time input + clock icon */}
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <TextInput
+                value={dueTime}
+                onChangeText={setDueTime}
+                placeholder="HH:mm (e.g. 14:30)"
+                placeholderTextColor={colors.textFaint}
+                style={[s.input, { flex: 1, marginBottom: 0 }]}
+                keyboardType="numeric"
+              />
+              <TouchableOpacity
+                onPress={() => {
+                  // Pre-set drum to current time value
+                  const parts = dueTime.split(":");
+                  setPickerHour(parseInt(parts[0]) || 9);
+                  setPickerMinute(parseInt(parts[1]) || 0);
+                  setShowTimePicker((v) => !v);
+                  setShowCalendar(false);
+                }}
+                style={{
+                  width: 42, height: 42,
+                  backgroundColor: showTimePicker ? "#38BDF8" : colors.surface,
+                  borderRadius: 10, borderWidth: 1,
+                  borderColor: showTimePicker ? "#38BDF8" : colors.border,
+                  alignItems: "center", justifyContent: "center",
+                }}
+              >
+                <Text style={{ fontSize: 20 }}>🕐</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Inline Time Picker */}
+            {showTimePicker && (
+              <View style={{
+                backgroundColor: colors.surface, borderRadius: 14,
+                padding: 12, marginTop: 8,
+                borderWidth: 1, borderColor: colors.border,
+              }}>
+                <Text style={{ color: colors.textMuted, fontSize: 12, textAlign: "center", marginBottom: 8 }}>
+                  Set Alarm Time
+                </Text>
+                {/* Hour + Minute scroll columns */}
+                <View style={{ flexDirection: "row", gap: 12, justifyContent: "center", marginBottom: 12 }}>
+                  {/* Hours */}
+                  <View style={{ alignItems: "center" }}>
+                    <Text style={{ color: colors.textMuted, fontSize: 11, marginBottom: 4 }}>Hour</Text>
+                    <ScrollView
+                      style={{ height: 120, width: 56 }}
+                      showsVerticalScrollIndicator={false}
+                      snapToInterval={36}
+                      decelerationRate="fast"
+                      contentContainerStyle={{ paddingVertical: 42 }}
+                    >
+                      {Array.from({ length: 24 }, (_, h) => (
+                        <TouchableOpacity
+                          key={h}
+                          onPress={() => setPickerHour(h)}
+                          style={{
+                            height: 36, alignItems: "center", justifyContent: "center",
+                            backgroundColor: pickerHour === h ? "#38BDF820" : "transparent",
+                            borderRadius: 8,
+                          }}
+                        >
+                          <Text style={{
+                            color: pickerHour === h ? "#38BDF8" : colors.text,
+                            fontWeight: pickerHour === h ? "800" : "400",
+                            fontSize: pickerHour === h ? 18 : 14,
+                          }}>{String(h).padStart(2, "0")}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                  </View>
+                  <Text style={{ color: colors.text, fontSize: 28, fontWeight: "700", alignSelf: "center" }}>:</Text>
+                  {/* Minutes */}
+                  <View style={{ alignItems: "center" }}>
+                    <Text style={{ color: colors.textMuted, fontSize: 11, marginBottom: 4 }}>Min</Text>
+                    <ScrollView
+                      style={{ height: 120, width: 56 }}
+                      showsVerticalScrollIndicator={false}
+                      snapToInterval={36}
+                      decelerationRate="fast"
+                      contentContainerStyle={{ paddingVertical: 42 }}
+                    >
+                      {[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55].map((m) => (
+                        <TouchableOpacity
+                          key={m}
+                          onPress={() => setPickerMinute(m)}
+                          style={{
+                            height: 36, alignItems: "center", justifyContent: "center",
+                            backgroundColor: pickerMinute === m ? "#38BDF820" : "transparent",
+                            borderRadius: 8,
+                          }}
+                        >
+                          <Text style={{
+                            color: pickerMinute === m ? "#38BDF8" : colors.text,
+                            fontWeight: pickerMinute === m ? "800" : "400",
+                            fontSize: pickerMinute === m ? 18 : 14,
+                          }}>{String(m).padStart(2, "0")}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                  </View>
+                </View>
+                {/* Selected time preview */}
+                <Text style={{ color: "#38BDF8", textAlign: "center", fontSize: 22, fontWeight: "800", marginBottom: 10 }}>
+                  {String(pickerHour).padStart(2, "0")}:{String(pickerMinute).padStart(2, "0")}
+                </Text>
+                <TouchableOpacity
+                  onPress={confirmTime}
+                  style={[s.saveBtn, { backgroundColor: "#38BDF8", marginTop: 0 }]}
+                >
+                  <Text style={s.saveBtnText}>Set Time ✓</Text>
+                </TouchableOpacity>
+              </View>
+            )}
 
             {/* Repeat */}
-            <Text style={s.label}>Repeat</Text>
-            <View style={{ flexDirection: "row", gap: 8 }}>
-              {["none", "daily", "weekly"].map((r) => (
+            <Text style={[s.label, { marginTop: 12 }]}>Repeat 🔁</Text>
+            <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
+              {REPEAT_OPTIONS.map((r) => (
                 <TouchableOpacity
-                  key={r}
-                  onPress={() => setRepeat(r)}
-                  style={[s.presetPill, repeat === r && s.presetPillActive]}
+                  key={r.key}
+                  onPress={() => setRepeat(r.key)}
+                  style={[s.presetPill, repeat === r.key && s.presetPillActive]}
                 >
-                  <Text style={[s.presetPillText, repeat === r && s.presetPillTextActive]}>
-                    {r === "none" ? "Do Not Repeat" : r === "daily" ? "Every Day" : "Every Week"}
+                  <Text style={[s.presetPillText, repeat === r.key && s.presetPillTextActive]}>
+                    {r.label}
                   </Text>
                 </TouchableOpacity>
               ))}
@@ -3599,7 +4122,7 @@ function TaskEditorModal({ visible, task, onClose, onSaved }) {
             <Pressable
               onPress={handleSave}
               disabled={saving}
-              style={[s.saveBtn, { backgroundColor: "#38BDF8", opacity: saving ? 0.6 : 1, marginTop: 14 }]}
+              style={[s.saveBtn, { backgroundColor: "#38BDF8", opacity: saving ? 0.6 : 1, marginTop: 16 }]}
             >
               <Text style={s.saveBtnText}>{saving ? "Saving..." : task ? "Update Task 🔄" : "Save Task & Reminder 🚀"}</Text>
             </Pressable>
@@ -3611,7 +4134,7 @@ function TaskEditorModal({ visible, task, onClose, onSaved }) {
 }
 
 // ───────────── TASKS SCREEN ─────────────
-function TasksScreen({ onMenuPress }) {
+function TasksScreen() {
   const [tasks, setTasks] = useState([]);
   const [filter, setFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("All");
@@ -3668,7 +4191,7 @@ function TasksScreen({ onMenuPress }) {
 
   return (
     <View style={s.screen}>
-      <ScreenHeader title="Tasks & Reminders" onMenuPress={onMenuPress} iconKey="tasks" />
+      <ScreenHeader title="Tasks & Reminders" iconKey="tasks" />
 
       <ScrollView
         contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 90 + TAB_BAR_HEIGHT }}
@@ -3790,7 +4313,9 @@ function TasksScreen({ onMenuPress }) {
 
                         {t.repeat !== "none" && (
                           <View style={s.taskBadge}>
-                            <Text style={s.taskBadgeText}>🔁 {t.repeat}</Text>
+                            <Text style={s.taskBadgeText}>
+                              🔁 {t.repeat === "daily" ? "Day by Day" : t.repeat === "weekly" ? "Weekly" : t.repeat}
+                            </Text>
                           </View>
                         )}
 
@@ -3898,7 +4423,7 @@ function NoteEditor({ visible, note, onClose, onSaved }) {
   );
 }
 
-function NotesScreen({ onMenuPress }) {
+function NotesScreen() {
   const [notes, setNotes] = useState([]);
   const [editorOpen, setEditorOpen] = useState(false);
   const [selected, setSelected] = useState(null);
@@ -3909,7 +4434,7 @@ function NotesScreen({ onMenuPress }) {
 
   return (
     <View style={s.screen}>
-      <ScreenHeader title="Notes" onMenuPress={onMenuPress} iconKey="notes" />
+      <ScreenHeader title="Notes" iconKey="notes" />
       <FlatList
         data={notes}
         keyExtractor={(item) => String(item.id)}
@@ -4169,10 +4694,10 @@ export default function App() {
   const [authStep, setAuthStep] = useState("loading"); // "loading" | "login" | "gender" | "main"
   const [authData, setAuthData] = useState(null); // { token, user, gender, sheetId }
   const [tab, setTab] = useState("home");
-  const [drawerOpen, setDrawerOpen] = useState(false);
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState(null);
+  const [themeMode, setThemeMode] = useState("dark");
 
   const isExpoGo =
     Constants.appOwnership === AppOwnership?.Expo ||
@@ -4262,6 +4787,14 @@ export default function App() {
       } catch (err) {
         console.warn("[AppInit] Database init error (fallback mode):", err);
       }
+      // Load persisted theme
+      try {
+        const savedTheme = await AsyncStorage.getItem(STORAGE_KEYS.THEME);
+        if (savedTheme === "light" || savedTheme === "dark") {
+          applyTheme(savedTheme);
+          setThemeMode(savedTheme);
+        }
+      } catch (_) {}
       try {
         const stored = await getStoredAuth();
         if (stored.token || stored.user) {
@@ -4380,7 +4913,6 @@ export default function App() {
     return true;
   });
 
-  const openMenu = () => setDrawerOpen(true);
   const openProfile = () => setProfileModalOpen(true);
 
   return (
@@ -4391,17 +4923,17 @@ export default function App() {
           userProfile: authData?.user,
         }}
       >
-        <ZoomContainer>
+        <ZoomContainer key={themeMode}>
           <View style={s.screen}>
             <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
-            {tab === "home" && <HomeScreen onMenuPress={openMenu} />}
-            {tab === "tasks" && <TasksScreen onMenuPress={openMenu} />}
-            {tab === "expenses" && <ExpensesScreen focusKey={tab} onMenuPress={openMenu} />}
-            {tab === "reports" && <ExpenseReportsScreen onMenuPress={openMenu} />}
-            {tab === "progress" && <ProgressScreen onMenuPress={openMenu} />}
-            {tab === "notes" && <NotesScreen onMenuPress={openMenu} />}
-            {tab === "buy" && <BuyScreen onMenuPress={openMenu} />}
-            {tab === "health" && userGender === "female" && <HealthScreen onMenuPress={openMenu} />}
+            {tab === "home" && <HomeScreen />}
+            {tab === "tasks" && <TasksScreen />}
+            {tab === "expenses" && <ExpensesScreen focusKey={tab} />}
+            {tab === "reports" && <ExpenseReportsScreen />}
+            {tab === "progress" && <ProgressScreen />}
+            {tab === "notes" && <NotesScreen />}
+            {tab === "buy" && <BuyScreen />}
+            {tab === "health" && userGender === "female" && <HealthScreen />}
 
             {/* ── BOTTOM TAB BAR (WhatsApp-style) ── */}
             <View style={s.bottomTabBar}>
@@ -4445,22 +4977,20 @@ export default function App() {
               </ScrollView>
             </View>
 
-            <Drawer
-              visible={drawerOpen}
-              onClose={() => setDrawerOpen(false)}
-              activeTab={tab === "health" && userGender === "male" ? "home" : tab}
-              onSelectTab={setTab}
-              tabs={currentTabs}
-              userProfile={authData?.user}
-              onSignOut={handleSignOut}
-            />
-
             <ProfileModal
               visible={profileModalOpen}
               onClose={() => setProfileModalOpen(false)}
               authData={authData}
               onUpdateUser={handleUpdateUserProfile}
               onSignOut={handleSignOut}
+              themeMode={themeMode}
+              onToggleTheme={async (nextMode) => {
+                applyTheme(nextMode);
+                setThemeMode(nextMode);
+                try {
+                  await AsyncStorage.setItem(STORAGE_KEYS.THEME, nextMode);
+                } catch (_) {}
+              }}
             />
           </View>
         </ZoomContainer>
@@ -4470,7 +5000,8 @@ export default function App() {
 }
 
 // ───────────── STYLESHEET ─────────────
-const s = StyleSheet.create({
+function createAppStyles(colors) {
+  return StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.bg },
   headerContainer: {
     flexDirection: "row",
@@ -5664,4 +6195,7 @@ const s = StyleSheet.create({
     fontWeight: "600",
     flex: 1,
   },
-});
+  });
+}
+
+const s = createAppStyles(colors);
