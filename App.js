@@ -160,26 +160,37 @@ function applyTheme(mode) {
   const target = mode === "light" ? lightColors : darkColors;
   Object.assign(colors, target);
   setSharedThemeColors(mode);
-  if (typeof createAppStyles === "function") {
-    Object.assign(s, createAppStyles(colors));
-  }
+  s = createAppStyles(colors);
 }
 
-const CHART_COLORS = [
-  "#6366F1", "#10B981", "#F59E0B", "#EC4899", "#06B6D4",
-  "#8B5CF6", "#F97316", "#14B8A6", "#3B82F6", "#E11D48",
-  "#84CC16", "#D946EF", "#0EA5E9", "#F43F5E", "#A855F7",
-  "#22C55E", "#EAB308", "#FB7185", "#2DD4BF", "#818CF8",
-  "#FB923C", "#4ADE80", "#C084FC", "#38BDF8", "#F472B6",
-  "#A3E635", "#FBBF24", "#67E8F9", "#F87171", "#34D399",
-];
+function hslToHex(h, satPercent, lightPercent) {
+  const sat = satPercent / 100;
+  const light = lightPercent / 100;
+  const a = sat * Math.min(light, 1 - light);
+  const channel = (n) => {
+    const k = (n + h / 30) % 12;
+    const value = light - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
+    return Math.round(255 * value).toString(16).padStart(2, "0");
+  };
+  return `#${channel(0)}${channel(8)}${channel(4)}`;
+}
+
+// Golden-angle hues keep every slice visually distinct past 15 categories.
+// The previous palette recycled the same five hue families.
+const CHART_COLOR_COUNT = 24;
+const CHART_COLORS = Array.from({ length: CHART_COLOR_COUNT }, (_, index) => {
+  const hue = (index * 137.508) % 360;
+  const sat = index % 2 === 0 ? 84 : 70;
+  const light = index % 3 === 0 ? 46 : index % 3 === 1 ? 58 : 40;
+  return hslToHex(hue, sat, light);
+});
 
 function chartColorAt(index) {
   if (index < CHART_COLORS.length) return CHART_COLORS[index];
-  const hue = (index * 47) % 360;
-  const sat = 65 + (index % 3) * 8;
-  const light = 48 + (index % 4) * 5;
-  return `hsl(${hue}, ${sat}%, ${light}%)`;
+  const hue = (index * 137.508) % 360;
+  const sat = 66 + (index % 3) * 8;
+  const light = 40 + (index % 4) * 5;
+  return hslToHex(hue, sat, light);
 }
 
 function isFutureDate(dateStr) {
@@ -1269,6 +1280,46 @@ async function togglePeriodDay(date) {
   }
   triggerTableSync("period_days");
 }
+const PERIOD_SPAN_DAYS = 5;
+
+async function markPeriodFromStart(startDate) {
+  const db = await getDb();
+  const range = Array.from({ length: PERIOD_SPAN_DAYS }, (_, i) => addDays(startDate, i));
+  const months = [...new Set(range.map((d) => d.slice(0, 7)))];
+
+  for (const monthPrefix of months) {
+    const existing = await db.getAllAsync(`SELECT date FROM period_days WHERE date LIKE ?`, [`${monthPrefix}%`]);
+    const incoming = range.filter((d) => d.startsWith(monthPrefix));
+    const union = new Set([...existing.map((row) => row.date), ...incoming]);
+    if (union.size > PERIOD_SPAN_DAYS) {
+      await db.runAsync(`DELETE FROM period_days WHERE date LIKE ?`, [`${monthPrefix}%`]);
+    }
+  }
+
+  for (const date of range) {
+    await db.runAsync(`INSERT OR IGNORE INTO period_days (date) VALUES (?)`, [date]);
+  }
+  triggerTableSync("period_days");
+}
+
+async function clearPeriodRun(date) {
+  const db = await getDb();
+  const rows = await db.getAllAsync(`SELECT date FROM period_days ORDER BY date ASC`);
+  const marked = new Set(rows.map((row) => row.date));
+  let start = date;
+  while (marked.has(addDays(start, -1))) start = addDays(start, -1);
+
+  const toDelete = [];
+  let cursor = start;
+  while (marked.has(cursor)) {
+    toDelete.push(cursor);
+    cursor = addDays(cursor, 1);
+  }
+  for (const day of toDelete) {
+    await db.runAsync(`DELETE FROM period_days WHERE date=?`, [day]);
+  }
+  triggerTableSync("period_days");
+}
 async function setMonthPeriodDays(monthPrefix, newDates) {
   const db = await getDb();
   await db.runAsync(`DELETE FROM period_days WHERE date LIKE ?`, [`${monthPrefix}%`]);
@@ -1363,7 +1414,9 @@ function TagDropdown({ kind, value, onChange, accentColor, placeholder, containe
           onFocus={() => setOpen(true)}
           placeholder={placeholder ?? "Category"}
           placeholderTextColor={colors.textFaint}
-          style={s.input}
+          cursorColor={colors.text}
+          selectionColor={accentColor}
+          style={[s.input, { color: colors.text }]}
         />
       </View>
       {open && (
@@ -1429,7 +1482,9 @@ function BreakdownTable({ items, onChange, accentColor }) {
           onChangeText={setDraftLabel}
           placeholder="Item name"
           placeholderTextColor={colors.textFaint}
-          style={[s.bdAddInput, { flex: 1.4 }]}
+          cursorColor={colors.text}
+          selectionColor={accentColor}
+          style={[s.bdAddInput, { flex: 1.4, color: colors.text }]}
         />
         <TextInput
           value={draftAmount}
@@ -1437,7 +1492,9 @@ function BreakdownTable({ items, onChange, accentColor }) {
           placeholder="0"
           placeholderTextColor={colors.textFaint}
           keyboardType="numeric"
-          style={[s.bdAddInput, { flex: 0.8, textAlign: "right" }]}
+          cursorColor={colors.text}
+          selectionColor={accentColor}
+          style={[s.bdAddInput, { flex: 0.8, textAlign: "right", color: colors.text }]}
         />
         <Pressable onPress={addRow} style={[s.bdAddBtn, { backgroundColor: accentColor }]}>
           <Text style={s.bdAddBtnText}>+</Text>
@@ -2211,22 +2268,13 @@ function HealthScreen() {
   const month = monthDate.getMonth();
   const cells = getMonthGrid(year, month);
   const monthLabel = monthDate.toLocaleDateString("en-US", { month: "long", year: "numeric" });
-  const monthPrefix = `${year}-${String(month + 1).padStart(2, "0")}`;
-  const monthMarkedCount = [...markedDays].filter((d) => d.startsWith(monthPrefix)).length;
-
   async function handleDayPress(day) {
     if (!day) return;
     const dateStr = toISODate(new Date(year, month, day));
-    const monthPrefix = `${year}-${String(month + 1).padStart(2, "0")}`;
-    const monthMarked = [...markedDays].filter((d) => d.startsWith(monthPrefix));
-
     if (markedDays.has(dateStr)) {
-      await togglePeriodDay(dateStr);
-    } else if (monthMarked.length >= 5) {
-      Alert.alert("Period days", "You can select up to 5 dates in a month.");
-      return;
+      await clearPeriodRun(dateStr);
     } else {
-      await togglePeriodDay(dateStr);
+      await markPeriodFromStart(dateStr);
     }
     loadData();
   }
@@ -2258,7 +2306,7 @@ function HealthScreen() {
             </Pressable>
             <View style={{ alignItems: "center" }}>
               <Text style={s.monthLabel}>{monthLabel}</Text>
-              <Text style={s.dateSub}>Select up to 5 days 🗓️</Text>
+              <Text style={s.dateSub}>Tap one day · the next 4 mark with it 🗓️</Text>
             </View>
             <Pressable onPress={() => setMonthDate(new Date(year, month + 1, 1))} hitSlop={12}>
               <Text style={s.arrow}>›</Text>
@@ -2277,14 +2325,13 @@ function HealthScreen() {
             {cells.map((day, i) => {
               const dateStr = day ? toISODate(new Date(year, month, day)) : null;
               const marked = dateStr && markedDays.has(dateStr);
-              const atCap = !marked && monthMarkedCount >= 5;
 
               return (
                 <Pressable
                   key={i}
                   disabled={!day}
                   onPress={() => handleDayPress(day)}
-                  style={[s.dayCell, atCap && { opacity: 0.35 }]}
+                  style={s.dayCell}
                 >
                   {day ? (
                     <View
@@ -2397,21 +2444,21 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <Pressable style={s.modalBackdrop} onPress={onClose} />
       <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
         style={{ flex: 1, justifyContent: "flex-end" }}
-        pointerEvents="box-none"
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 10 : 0}
       >
+        <Pressable style={{ flex: 1 }} onPress={onClose} />
         <ScrollView
-          contentContainerStyle={{ flexGrow: 1, justifyContent: "flex-end" }}
+          style={{ maxHeight: "88%", flexGrow: 0 }}
           keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-          bounces={false}
+          showsVerticalScrollIndicator
+          nestedScrollEnabled
+          contentContainerStyle={{ paddingBottom: 4 }}
         >
-          <View style={s.sheetCompact}>
+          <View style={[s.sheetCompact, { paddingBottom: BOTTOM_INSET + 20 }]}>
             <View style={s.grabber} />
-
             {/* Income / Expense Segment Selector */}
             <View style={s.segment}>
               <Pressable
@@ -2449,7 +2496,14 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
                 placeholderTextColor={colors.textFaint}
                 keyboardType="numeric"
                 editable={breakdown.length === 0}
-                style={[s.input, s.quickAmountInput, breakdown.length > 0 && { opacity: 0.6 }]}
+                cursorColor={colors.text}
+                selectionColor={accent}
+                style={[
+                  s.input,
+                  s.quickAmountInput,
+                  { color: colors.text },
+                  breakdown.length > 0 && { opacity: 0.6 },
+                ]}
               />
             </View>
 
@@ -2777,7 +2831,7 @@ function DonutChart({ rows, colorsForRows }) {
   const total = rows.reduce((sum, row) => sum + row.total, 0);
   const radius = 52;
   const circumference = 2 * Math.PI * radius;
-  const GAP_DEG = rows.length > 1 ? 2.5 : 0; // distinct gap between each segment
+  const GAP_DEG = rows.length > 1 ? 4 : 0;
   const gapLength = (GAP_DEG / 360) * circumference;
   const [selectedIdx, setSelectedIdx] = useState(null);
 
@@ -2809,7 +2863,7 @@ function DonutChart({ rows, colorsForRows }) {
     const fraction = total ? row.total / total : 0;
     const sliceLength = fraction * circumference;
     const animatedSlice = sliceLength * loadProgress;
-    const drawnLength = Math.max(0, animatedSlice - (loadProgress > 0.4 ? gapLength : 0));
+    const drawnLength = Math.max(0, animatedSlice - gapLength * loadProgress);
     return { ...row, fraction, sliceLength: animatedSlice, drawnLength };
   });
 
@@ -2840,7 +2894,7 @@ function DonutChart({ rows, colorsForRows }) {
                 fill="none"
                 strokeDasharray={`${seg.drawnLength} ${circumference}`}
                 strokeDashoffset={offset}
-                strokeLinecap={loadProgress > 0.9 ? "round" : "butt"}
+                strokeLinecap="butt"
                 rotation="-90"
                 origin="71,71"
                 opacity={selectedIdx === null || isSelected ? 1 : 0.35}
@@ -3248,6 +3302,10 @@ function BuyScreen() {
     await swapBuyItemsOrder(items[index], items[swapIndex]);
     loadData();
   }
+
+  const pendingItems = items.filter((item) => !item.completed);
+  const doneItems = items.filter((item) => !!item.completed);
+  const balanceColor = currentBalance >= 0 ? colors.positive : colors.negative;
 
   // Cumulative Priority Budgeting: higher priority items consume the balance first!
   const affordMap = new Map();
@@ -3671,16 +3729,57 @@ function ProfileModal({ visible, onClose, authData, onUpdateUser, onSignOut, the
                 activeOpacity={0.8}
               >
                 <View style={s.profileOptionIconWrap}>
-                  <Text style={{ fontSize: 20 }}>🌙</Text>
+                  <Text style={{ fontSize: 20 }}>{themeMode === "light" ? "☀️" : "🌙"}</Text>
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={s.profileOptionTitle}>Theme</Text>
-                  <Text style={s.profileOptionSub}>Dark Theme (Default) · OLED optimized</Text>
+                  <Text style={s.profileOptionSub}>
+                    {themeMode === "light" ? "Light theme · warm paper" : "Dark theme · OLED"}
+                  </Text>
                 </View>
                 <View style={s.themeBadge}>
-                  <Text style={s.themeBadgeText}>Dark ✓</Text>
+                  <Text style={s.themeBadgeText}>{themeMode === "light" ? "Light ✓" : "Dark ✓"}</Text>
                 </View>
               </TouchableOpacity>
+
+              {activeTab === "theme" && (
+                <View style={{ flexDirection: "row", gap: 8, marginBottom: 8 }}>
+                  <Pressable
+                    onPress={() => onToggleTheme("light")}
+                    style={[
+                      s.saveBtn,
+                      {
+                        flex: 1,
+                        marginTop: 0,
+                        backgroundColor: themeMode === "light" ? colors.streakOrange : colors.surface,
+                        borderWidth: 1,
+                        borderColor: themeMode === "light" ? colors.streakOrange : colors.border,
+                      },
+                    ]}
+                  >
+                    <Text style={{ color: themeMode === "light" ? "#FFF" : colors.text, fontWeight: "800" }}>
+                      Light
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => onToggleTheme("dark")}
+                    style={[
+                      s.saveBtn,
+                      {
+                        flex: 1,
+                        marginTop: 0,
+                        backgroundColor: themeMode === "dark" ? colors.notes : colors.surface,
+                        borderWidth: 1,
+                        borderColor: themeMode === "dark" ? colors.notes : colors.border,
+                      },
+                    ]}
+                  >
+                    <Text style={{ color: themeMode === "dark" ? "#FFF" : colors.text, fontWeight: "800" }}>
+                      Dark
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
 
               {/* Option 3: Notifications */}
               <TouchableOpacity
@@ -4200,8 +4299,8 @@ function TasksScreen() {
         {/* Banner */}
         <View style={s.bannerCard}>
           <EditableImage
-            imageKey="banner_tasks"
-            defaultSource={LOCAL_ASSETS.minato}
+                      imageKey="banner_tasks"
+                      defaultSource={LOCAL_ASSETS.jiraiya}
             style={s.bannerImage}
             resizeMode="contain"
           />
@@ -4863,9 +4962,12 @@ export default function App() {
     setAuthStep("gender");
   }
 
+  const statusBarStyle = themeMode === "light" ? "dark-content" : "light-content";
+
   if (!ready || authStep === "loading") {
     return (
       <GestureHandlerRootView style={{ flex: 1 }}>
+        <StatusBar barStyle={statusBarStyle} backgroundColor={colors.bg} />
         <View style={[s.screen, { alignItems: "center", justifyContent: "center" }]}>
           <Text style={{ color: colors.textMuted }}>Loading Winnie… 🐾</Text>
         </View>
@@ -4876,7 +4978,7 @@ export default function App() {
   if (authStep === "login") {
     return (
       <GestureHandlerRootView style={{ flex: 1 }}>
-        <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
+        <StatusBar barStyle={statusBarStyle} backgroundColor={colors.bg} />
         <LoginScreen
           onGoogleLogin={() => {
             setAuthError(null);
@@ -4898,7 +5000,7 @@ export default function App() {
   if (authStep === "gender") {
     return (
       <GestureHandlerRootView style={{ flex: 1 }}>
-        <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
+        <StatusBar barStyle={statusBarStyle} backgroundColor={colors.bg} />
         <GenderSelectScreen
           userName={authData?.user?.name || "Friend"}
           onSelectGender={handleSelectGender}
@@ -4925,7 +5027,7 @@ export default function App() {
       >
         <ZoomContainer key={themeMode}>
           <View style={s.screen}>
-            <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
+            <StatusBar barStyle={statusBarStyle} backgroundColor={colors.bg} />
             {tab === "home" && <HomeScreen />}
             {tab === "tasks" && <TasksScreen />}
             {tab === "expenses" && <ExpensesScreen focusKey={tab} />}
@@ -5847,11 +5949,12 @@ function createAppStyles(colors) {
     ...cardShadow,
   },
   bottomTabItem: {
-    flex: 1,
+    minWidth: 72,
     alignItems: "center",
     justifyContent: "center",
     gap: 2,
     position: "relative",
+    paddingHorizontal: 8,
     paddingVertical: 2,
   },
   bottomTabIcon: {
@@ -6198,4 +6301,4 @@ function createAppStyles(colors) {
   });
 }
 
-const s = createAppStyles(colors);
+let s = createAppStyles(colors);
