@@ -22,7 +22,15 @@
       }
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/favicon.png",
+      "name": "Winnie",
+      "shortName": "Winnie",
+      "display": "standalone",
+      "startUrl": "/",
+      "scope": "/",
+      "themeColor": "#120F0D",
+      "backgroundColor": "#120F0D",
+      "lang": "en"
     },
     "plugins": [
       "expo-sqlite",

@@ -45,7 +45,32 @@ import ZoomContainer from "./src/components/ZoomContainer";
 import EditableImage from "./src/components/EditableImage";
 import { setThemeColors as setSharedThemeColors } from "./src/constants/theme";
 
-WebBrowser.maybeCompleteAuthSession();
+try {
+  WebBrowser.maybeCompleteAuthSession();
+} catch (authSessionError) {
+  console.log("[GoogleAuth] Could not complete the popup session:", authSessionError?.message || authSessionError);
+  if (typeof window !== "undefined" && window.localStorage) {
+    window.localStorage.removeItem("ExpoWebBrowserRedirectHandle");
+  }
+}
+
+function readWebOAuthHash() {
+  if (Platform.OS !== "web" || typeof window === "undefined") return { token: null, error: null };
+  const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : "";
+  if (!hash) return { token: null, error: null };
+  const params = new URLSearchParams(hash);
+  const token = params.get("access_token");
+  const error = params.get("error_description") || params.get("error");
+  if (token || error) {
+    const cleanPath = `${window.location.pathname}${window.location.search}` || "/";
+    window.history.replaceState(null, "", cleanPath);
+  }
+  return { token, error };
+}
+
+const webOAuthHash = readWebOAuthHash();
+let authDecisionLocked = false;
+let googleSignInToken = null;
 
 // ───────────── LOCAL ASSETS MAP ─────────────
 const LOCAL_ASSETS = {
@@ -101,6 +126,7 @@ const APP_ICONS = {
   empty: { uri: "https://img.icons8.com/color/48/box--v1.png" },
   buy: { uri: "https://img.icons8.com/color/48/shopping-cart--v1.png" },
   calendar: { uri: "https://img.icons8.com/color/48/google-calendar--v2.png" },
+  settle: { uri: "https://img.icons8.com/color/48/money-transfer.png" },
 };
 
 // ───────────── THEME & PALETTE ─────────────
@@ -304,6 +330,8 @@ const STORAGE_KEYS = {
   GENDER: "@winnie_user_gender",
   SHEET_ID: "@winnie_sheet_id",
   THEME: "@winnie_theme_mode",
+  NOTIFICATIONS: "@winnie_notifications",
+  NOTIFIED_SLOTS: "@winnie_notified_slots",
 };
 
 export async function getStoredAuth() {
@@ -377,6 +405,7 @@ const TABLE_COLUMNS = {
   notes: ["id", "title", "body", "created_at", "updated_at"],
   buy_items: ["id", "title", "completed", "price_min", "price_max", "sort_order", "created_at"],
   tasks: ["id", "title", "description", "due_date", "due_time", "priority", "category", "repeat", "completed", "google_event_id", "created_at"],
+  settlements: ["id", "direction", "person", "amount", "note", "settled", "created_at"],
 };
 
 export async function createOrFindSpreadsheet(token) {
@@ -662,6 +691,16 @@ async function initDatabase() {
       repeat TEXT NOT NULL DEFAULT 'none',
       completed INTEGER NOT NULL DEFAULT 0,
       google_event_id TEXT DEFAULT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS settlements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      direction TEXT NOT NULL CHECK (direction IN ('give', 'get')),
+      person TEXT NOT NULL,
+      amount REAL NOT NULL,
+      note TEXT DEFAULT '',
+      settled INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
@@ -1005,8 +1044,10 @@ export async function syncTaskToGoogleCalendar(token, task) {
       reminders: {
         useDefault: false,
         overrides: [
-          { method: "popup", minutes: 15 }, // 15 min before
-          { method: "popup", minutes: 0 },  // at due time
+          { method: "popup", minutes: 15 },
+          { method: "popup", minutes: 0 },
+          { method: "email", minutes: 15 },
+          { method: "email", minutes: 0 },
         ],
       },
     };
@@ -1066,6 +1107,9 @@ async function listTasks() {
 
 async function addTask({ title, description = "", dueDate = todayISO(), dueTime = "09:00", priority = "medium", category = "General", repeat = "none" }) {
   const db = await getDb();
+  if (await notificationsAreEnabled()) {
+    requestNotificationPermission().catch(() => {});
+  }
   let googleEventId = null;
   if (activeToken) {
     googleEventId = await syncTaskToGoogleCalendar(activeToken, {
@@ -1130,6 +1174,117 @@ async function deleteTask(id, googleEventId) {
   }
   await db.runAsync(`DELETE FROM tasks WHERE id = ?`, [id]);
   triggerTableSync("tasks");
+}
+
+async function notificationsAreEnabled() {
+  try {
+    const flag = await AsyncStorage.getItem(STORAGE_KEYS.NOTIFICATIONS);
+    return flag !== "off";
+  } catch {
+    return true;
+  }
+}
+
+async function setNotificationsEnabled(enabled) {
+  await AsyncStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, enabled ? "on" : "off");
+  if (enabled) await requestNotificationPermission();
+}
+
+async function requestNotificationPermission() {
+  if (Platform.OS !== "web" || typeof Notification === "undefined") return false;
+  try {
+    if (navigator.serviceWorker) {
+      await navigator.serviceWorker.register("/reminder-sw.js");
+    }
+  } catch (err) {
+    console.log("[Reminders] Service worker registration failed:", err);
+  }
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission === "denied") return false;
+  const result = await Notification.requestPermission();
+  return result === "granted";
+}
+
+async function showReminder(title, body) {
+  if (Platform.OS === "web" && typeof Notification !== "undefined" && Notification.permission === "granted") {
+    try {
+      const registration = navigator.serviceWorker ? await navigator.serviceWorker.getRegistration() : null;
+      if (registration?.showNotification) {
+        await registration.showNotification(title, { body, icon: "/favicon.png" });
+        return;
+      }
+    } catch (err) {
+      console.log("[Reminders] Service worker notification failed:", err);
+    }
+    try {
+      new Notification(title, { body });
+      return;
+    } catch (err) {
+      console.log("[Reminders] Notification failed:", err);
+    }
+  }
+  if (Platform.OS !== "web") {
+    Alert.alert(title, body);
+  }
+}
+
+async function checkTaskReminders() {
+  if (!(await notificationsAreEnabled())) return;
+  let tasks = [];
+  try {
+    tasks = await listTasks();
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  let notified = {};
+  try {
+    notified = JSON.parse((await AsyncStorage.getItem(STORAGE_KEYS.NOTIFIED_SLOTS)) || "{}");
+  } catch {
+    notified = {};
+  }
+  let changed = false;
+  for (const task of tasks) {
+    if (task.completed) continue;
+    const due = new Date(`${task.due_date}T${(task.due_time || "09:00").slice(0, 5)}:00`).getTime();
+    if (Number.isNaN(due)) continue;
+    const slots = [
+      { id: `${task.id}:15`, at: due - 15 * 60 * 1000, title: "In 15 minutes", body: task.title },
+      { id: `${task.id}:0`, at: due, title: "Reminder", body: task.title },
+    ];
+    for (const slot of slots) {
+      if (notified[slot.id]) continue;
+      if (now >= slot.at && now - slot.at < 20 * 60 * 1000) {
+        await showReminder(slot.title, slot.body);
+        notified[slot.id] = now;
+        changed = true;
+      }
+    }
+  }
+  if (changed) {
+    await AsyncStorage.setItem(STORAGE_KEYS.NOTIFIED_SLOTS, JSON.stringify(notified));
+  }
+}
+
+async function listSettlements() {
+  const db = await getDb();
+  return db.getAllAsync(`SELECT * FROM settlements WHERE settled = 0 ORDER BY direction ASC, person COLLATE NOCASE ASC, id ASC`);
+}
+
+async function addSettlement({ direction, person, amount, note = "" }) {
+  const db = await getDb();
+  const result = await db.runAsync(
+    `INSERT INTO settlements (direction, person, amount, note, settled) VALUES (?, ?, ?, ?, 0)`,
+    [direction, person.trim(), amount, note.trim()]
+  );
+  triggerTableSync("settlements");
+  return result.lastInsertRowId;
+}
+
+async function deleteSettlement(id) {
+  const db = await getDb();
+  await db.runAsync(`DELETE FROM settlements WHERE id = ?`, [id]);
+  triggerTableSync("settlements");
 }
 
 // ───────────── NOTES QUERIES ─────────────
@@ -1211,6 +1366,16 @@ async function getMonthlyExpenseReport(year, month) {
      WHERE e.type='expense' AND e.date LIKE ?
      GROUP BY category ORDER BY total DESC`,
     [`${prefix}-%`]
+  );
+}
+async function getCategorySpendHistory(category) {
+  const db = await getDb();
+  return db.getAllAsync(
+    `SELECT e.id, e.date, e.title, e.amount
+     FROM expenses e LEFT JOIN tags t ON t.id = e.category_id
+     WHERE e.type = 'expense' AND COALESCE(t.name, 'Uncategorised') = ?
+     ORDER BY e.date DESC, e.id DESC`,
+    [category]
   );
 }
 async function addExpense(entry) {
@@ -2827,13 +2992,14 @@ function ExpensesScreen({ focusKey }) {
 }
 
 // ───────────── EXPENSE REPORTS ─────────────
-function DonutChart({ rows, colorsForRows }) {
+function DonutChart({ rows, selectedCategory = null, onSelectCategory }) {
   const total = rows.reduce((sum, row) => sum + row.total, 0);
   const radius = 52;
   const circumference = 2 * Math.PI * radius;
   const GAP_DEG = rows.length > 1 ? 4 : 0;
   const gapLength = (GAP_DEG / 360) * circumference;
-  const [selectedIdx, setSelectedIdx] = useState(null);
+  const selectedIdxRaw = rows.findIndex((row) => row.category === selectedCategory);
+  const selectedIdx = selectedIdxRaw >= 0 ? selectedIdxRaw : null;
 
   // Progressive loading animation: chart segments fill up smoothly from 0 to 100%
   const [loadProgress, setLoadProgress] = useState(0);
@@ -2904,7 +3070,7 @@ function DonutChart({ rows, colorsForRows }) {
         </Svg>
 
         {/* Center info */}
-        <Pressable style={s.donutCenter} onPress={() => setSelectedIdx(null)}>
+        <Pressable style={s.donutCenter} onPress={() => onSelectCategory?.(null)}>
           {selectedRow ? (
             <View style={{ alignItems: "center", paddingHorizontal: 12 }}>
               <Text
@@ -2946,7 +3112,7 @@ function DonutChart({ rows, colorsForRows }) {
           return (
             <Pressable
               key={row.category}
-              onPress={() => setSelectedIdx(isSelected ? null : index)}
+              onPress={() => onSelectCategory?.(isSelected ? null : row.category)}
               style={{
                 flexDirection: "row",
                 alignItems: "center",
@@ -3078,8 +3244,10 @@ function ExpenseReportsScreen() {
   const [month, setMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [rows, setRows] = useState([]);
   const [rituals, setRituals] = useState([]);
-  const [summary, setSummary] = useState({ income: 0, expense: 0 });
+  const [summary, setSummary] = useState({ income: 0, expense: 0, carriedForward: 0 });
   const [loading, setLoading] = useState(true);
+  const [selectedCategory, setSelectedCategory] = useState(null);
+  const [categoryHistory, setCategoryHistory] = useState([]);
 
   const spinAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -3117,12 +3285,16 @@ function ExpenseReportsScreen() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const [monthSummary, reportRows, allRituals] = await Promise.all([
-      getMonthlySummary(month.getFullYear(), month.getMonth()),
-      getMonthlyExpenseReport(month.getFullYear(), month.getMonth()),
+    const year = month.getFullYear();
+    const monthIndex = month.getMonth();
+    const monthStart = `${year}-${String(monthIndex + 1).padStart(2, "0")}-01`;
+    const [monthSummary, reportRows, allRituals, carriedForward] = await Promise.all([
+      getMonthlySummary(year, monthIndex),
+      getMonthlyExpenseReport(year, monthIndex),
       listRituals(),
+      getCarriedForwardBalance(monthStart),
     ]);
-    setSummary(monthSummary);
+    setSummary({ ...monthSummary, carriedForward });
     setRows(reportRows);
     setRituals(allRituals);
     setLoading(false);
@@ -3131,6 +3303,24 @@ function ExpenseReportsScreen() {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    setSelectedCategory(null);
+  }, [month]);
+
+  useEffect(() => {
+    if (!selectedCategory) {
+      setCategoryHistory([]);
+      return;
+    }
+    let cancelled = false;
+    getCategorySpendHistory(selectedCategory).then((history) => {
+      if (!cancelled) setCategoryHistory(history);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedCategory]);
 
   const max = Math.max(...rows.map((row) => row.total), 1);
   const monthName = month.toLocaleDateString("en-US", { month: "long", year: "numeric" });
@@ -3174,19 +3364,25 @@ function ExpenseReportsScreen() {
 
           <View style={s.reportMetricsRow}>
             <View style={s.reportMetricCol}>
-              <Text style={s.balanceLabel}>Total Income 💵</Text>
+              <Text style={s.balanceLabel}>C/F last</Text>
+              <Text style={[s.reportMetricValue, { color: colors.text }]}>
+                ₹{(summary.carriedForward || 0).toFixed(0)}
+              </Text>
+            </View>
+            <View style={s.reportMetricCol}>
+              <Text style={s.balanceLabel}>Income 💵</Text>
               <Text style={[s.reportMetricValue, { color: colors.positive }]}>
                 +₹{summary.income.toFixed(0)}
               </Text>
             </View>
             <View style={s.reportMetricCol}>
-              <Text style={s.balanceLabel}>Total Expense 🛍️</Text>
+              <Text style={s.balanceLabel}>Expense 🛍️</Text>
               <Text style={[s.reportMetricValue, { color: colors.expense }]}>
                 −₹{summary.expense.toFixed(0)}
               </Text>
             </View>
             <View style={[s.reportMetricCol, { alignItems: "flex-end" }]}>
-              <Text style={s.balanceLabel}>Net Balance 🏦</Text>
+              <Text style={s.balanceLabel}>Net 🏦</Text>
               <Text
                 style={[
                   s.reportMetricValue,
@@ -3219,7 +3415,7 @@ function ExpenseReportsScreen() {
             <Text style={s.listLabel}>Spending Bars 📊</Text>
             <View style={[s.reportCard, cardShadow]}>
               {rows.map((row, index) => (
-                <View key={row.category} style={s.barChartRow}>
+                <Pressable key={row.category} style={s.barChartRow} onPress={() => setSelectedCategory(row.category)}>
                   <Text style={s.barChartLabel} numberOfLines={1}>
                     {row.category}
                   </Text>
@@ -3235,13 +3431,52 @@ function ExpenseReportsScreen() {
                     />
                   </View>
                   <Text style={s.barAmount}>₹{row.total.toFixed(0)}</Text>
-                </View>
+                </Pressable>
               ))}
             </View>
 
             <Text style={s.listLabel}>Share of Spending 🍩</Text>
             <View style={[s.reportCard, cardShadow]}>
-              <DonutChart rows={rows} colorsForRows={CHART_COLORS} />
+              <DonutChart
+                rows={rows}
+                selectedCategory={selectedCategory}
+                onSelectCategory={setSelectedCategory}
+              />
+              {selectedCategory ? (
+                <View style={{ marginTop: 16, width: "100%" }}>
+                  <Text style={[s.entryTitle, { marginBottom: 8 }]}>
+                    {selectedCategory} history
+                  </Text>
+                  {categoryHistory.length === 0 ? (
+                    <Text style={s.dateSub}>No spending recorded for this category yet.</Text>
+                  ) : (
+                    categoryHistory.map((entry) => (
+                      <View
+                        key={entry.id}
+                        style={{
+                          flexDirection: "row",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          paddingVertical: 8,
+                          borderTopWidth: 1,
+                          borderTopColor: colors.border,
+                          gap: 10,
+                        }}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text style={s.entryTitle} numberOfLines={1}>{entry.title}</Text>
+                          <Text style={s.dateSub}>{shortDate(entry.date)}</Text>
+                        </View>
+                        <Text style={[s.barAmount, { width: "auto" }]}>₹{Number(entry.amount).toFixed(0)}</Text>
+                      </View>
+                    ))
+                  )}
+                </View>
+              ) : (
+                <Text style={[s.dateSub, { marginTop: 12, textAlign: "center" }]}>
+                  Tap a category to see every date and amount.
+                </Text>
+              )}
             </View>
 
             {/* RITUAL CONSISTENCY REPORT SECTION */}
@@ -3604,13 +3839,18 @@ function BuyScreen() {
 
 // ───────────── PRESET AVATARS ─────────────
 const PRESET_AVATARS = [
-  { id: "winnie", name: "Winnie", uri: "https://images.unsplash.com/photo-1543466835-00a7907e9de1?w=150" },
-  { id: "luffy", name: "Luffy", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Luffy&backgroundColor=ffd5dc" },
-  { id: "naruto", name: "Naruto", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Naruto&backgroundColor=ffdfbf" },
-  { id: "shinobu", name: "Shinobu", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Shinobu&backgroundColor=d1d4f9" },
-  { id: "minato", name: "Minato", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Minato&backgroundColor=c0aede" },
-  { id: "inosuke", name: "Inosuke", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Inosuke&backgroundColor=b6e3f4" },
-  { id: "jiraiya", name: "Jiraiya", uri: "https://api.dicebear.com/7.x/adventurer/png?seed=Jiraiya&backgroundColor=d1d4f9" },
+  { id: "nova", name: "Nova", uri: "https://api.dicebear.com/7.x/lorelei/png?seed=Nova&backgroundColor=ff6b6b&radius=50" },
+  { id: "milo", name: "Milo", uri: "https://api.dicebear.com/7.x/lorelei/png?seed=Milo&backgroundColor=4dabf7&radius=50" },
+  { id: "asha", name: "Asha", uri: "https://api.dicebear.com/7.x/lorelei/png?seed=Asha&backgroundColor=ffd43b&radius=50" },
+  { id: "kai", name: "Kai", uri: "https://api.dicebear.com/7.x/micah/png?seed=Kai&backgroundColor=69db7c&radius=50" },
+  { id: "remy", name: "Remy", uri: "https://api.dicebear.com/7.x/micah/png?seed=Remy&backgroundColor=845ef7&radius=50" },
+  { id: "sora", name: "Sora", uri: "https://api.dicebear.com/7.x/lorelei/png?seed=Sora&backgroundColor=ff922b&radius=50" },
+  { id: "jules", name: "Jules", uri: "https://api.dicebear.com/7.x/notionists/png?seed=Jules&backgroundColor=f06595&radius=50" },
+  { id: "noor", name: "Noor", uri: "https://api.dicebear.com/7.x/notionists/png?seed=Noor&backgroundColor=20c997&radius=50" },
+  { id: "theo", name: "Theo", uri: "https://api.dicebear.com/7.x/micah/png?seed=Theo&backgroundColor=fab005&radius=50" },
+  { id: "indi", name: "Indi", uri: "https://api.dicebear.com/7.x/lorelei/png?seed=Indi&backgroundColor=228be6&radius=50" },
+  { id: "marlow", name: "Marlow", uri: "https://api.dicebear.com/7.x/notionists/png?seed=Marlow&backgroundColor=e8590c&radius=50" },
+  { id: "pia", name: "Pia", uri: "https://api.dicebear.com/7.x/lorelei/png?seed=Pia&backgroundColor=9c36b5&radius=50" },
 ];
 
 // ───────────── PROFILE & SETTINGS MODAL ─────────────
@@ -3618,7 +3858,12 @@ function ProfileModal({ visible, onClose, authData, onUpdateUser, onSignOut, the
   const user = authData?.user || { name: "Friend", email: "" };
   const [activeTab, setActiveTab] = useState("avatar");
   const [customUrl, setCustomUrl] = useState("");
-  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [notificationsEnabled, setNotificationsFlag] = useState(true);
+
+  useEffect(() => {
+    if (!visible) return;
+    notificationsAreEnabled().then(setNotificationsFlag).catch(() => {});
+  }, [visible]);
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
@@ -3783,7 +4028,14 @@ function ProfileModal({ visible, onClose, authData, onUpdateUser, onSignOut, the
 
               {/* Option 3: Notifications */}
               <TouchableOpacity
-                onPress={() => setNotificationsEnabled((prev) => !prev)}
+                onPress={async () => {
+                  const next = !notificationsEnabled;
+                  setNotificationsFlag(next);
+                  await setNotificationsEnabled(next);
+                  if (next && Platform.OS === "web" && typeof Notification !== "undefined" && Notification.permission === "denied") {
+                    Alert.alert("Notifications are blocked", "Allow notifications for this site in Safari settings, then turn this on again.");
+                  }
+                }}
                 style={s.profileOptionCard}
                 activeOpacity={0.8}
               >
@@ -3792,7 +4044,7 @@ function ProfileModal({ visible, onClose, authData, onUpdateUser, onSignOut, the
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={s.profileOptionTitle}>Notifications & Reminders</Text>
-                  <Text style={s.profileOptionSub}>15 mins before & at due time on Google Calendar</Text>
+                  <Text style={s.profileOptionSub}>15 minutes before, and again at the due time</Text>
                 </View>
                 <View style={[s.notificationTogglePill, notificationsEnabled ? s.notificationToggleActive : s.notificationToggleInactive]}>
                   <Text style={{ color: "#FFF", fontSize: 11, fontWeight: "800" }}>{notificationsEnabled ? "ON" : "OFF"}</Text>
@@ -4306,7 +4558,7 @@ function TasksScreen() {
           />
           <View style={s.bannerOverlay}>
             <Text style={s.bannerTitle}>Focus & Achieve 🎯</Text>
-            <Text style={s.bannerSub}>Smart reminders synced to your Google Calendar ⚡</Text>
+            <Text style={s.bannerSub}>Alerts 15 minutes before, and again when it's due ⚡</Text>
           </View>
         </View>
 
@@ -4620,11 +4872,159 @@ function NotesScreen() {
   );
 }
 
+// ───────────── GIVE / GET ─────────────
+function SettleScreen() {
+  const [items, setItems] = useState([]);
+  const [person, setPerson] = useState("");
+  const [amount, setAmount] = useState("");
+  const [direction, setDirection] = useState("give");
+  const [formOpen, setFormOpen] = useState(false);
+
+  const load = useCallback(async () => {
+    setItems(await listSettlements());
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function handleAdd() {
+    const amountNum = Number(amount);
+    if (!person.trim() || !amountNum) return;
+    await addSettlement({ direction, person, amount: amountNum });
+    setPerson("");
+    setAmount("");
+    setFormOpen(false);
+    load();
+  }
+
+  const giveItems = items.filter((item) => item.direction === "give");
+  const getItems = items.filter((item) => item.direction === "get");
+  const giveTotal = giveItems.reduce((sum, item) => sum + Number(item.amount), 0);
+  const getTotal = getItems.reduce((sum, item) => sum + Number(item.amount), 0);
+
+  function renderGroup(title, rows, tint) {
+    return (
+      <View style={{ marginTop: 16 }}>
+        <Text style={s.listLabel}>{title}</Text>
+        {rows.length === 0 ? (
+          <Text style={s.dateSub}>Nothing here yet.</Text>
+        ) : (
+          rows.map((item) => (
+            <View key={item.id} style={[s.summaryCard, { marginBottom: 8, paddingVertical: 12 }]}>
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.entryTitle}>{item.person}</Text>
+                  {item.note ? <Text style={s.dateSub}>{item.note}</Text> : null}
+                </View>
+                <Text style={{ color: tint, fontWeight: "800", fontSize: 16 }}>₹{Number(item.amount).toFixed(0)}</Text>
+                <Pressable
+                  onPress={async () => {
+                    await deleteSettlement(item.id);
+                    load();
+                  }}
+                  hitSlop={8}
+                >
+                  <Text style={s.entryDeleteX}>×</Text>
+                </Pressable>
+              </View>
+            </View>
+          ))
+        )}
+      </View>
+    );
+  }
+
+  return (
+    <View style={s.screen}>
+      <ScreenHeader title="Give & Get" iconKey="settle" />
+      <ScrollView
+        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 100 + TAB_BAR_HEIGHT }}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={[s.summaryCard, cardShadow, { marginTop: 12 }]}>
+          <View style={s.reportMetricsRow}>
+            <View style={s.reportMetricCol}>
+              <Text style={s.balanceLabel}>To give</Text>
+              <Text style={[s.reportMetricValue, { color: colors.negative }]}>₹{giveTotal.toFixed(0)}</Text>
+            </View>
+            <View style={[s.reportMetricCol, { alignItems: "flex-end" }]}>
+              <Text style={s.balanceLabel}>To get</Text>
+              <Text style={[s.reportMetricValue, { color: colors.positive }]}>₹{getTotal.toFixed(0)}</Text>
+            </View>
+          </View>
+        </View>
+
+        {renderGroup("Give", giveItems, colors.negative)}
+        {renderGroup("Get", getItems, colors.positive)}
+
+        {formOpen && (
+          <View style={[s.summaryCard, cardShadow, { marginTop: 16 }]}>
+            <View style={s.segment}>
+              <Pressable
+                onPress={() => setDirection("give")}
+                style={[s.segmentBtn, direction === "give" && { backgroundColor: colors.negative }]}
+              >
+                <Text style={[s.segmentText, direction === "give" && s.segmentTextActive]}>Give</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setDirection("get")}
+                style={[s.segmentBtn, direction === "get" && { backgroundColor: colors.positive }]}
+              >
+                <Text style={[s.segmentText, direction === "get" && s.segmentTextActive]}>Get</Text>
+              </Pressable>
+            </View>
+            <Text style={s.label}>Person</Text>
+            <TextInput
+              value={person}
+              onChangeText={setPerson}
+              placeholder="Friend's name"
+              placeholderTextColor={colors.textFaint}
+              cursorColor={colors.text}
+              style={[s.input, { color: colors.text }]}
+            />
+            <Text style={s.label}>Amount (₹)</Text>
+            <TextInput
+              value={amount}
+              onChangeText={setAmount}
+              placeholder="0"
+              placeholderTextColor={colors.textFaint}
+              keyboardType="numeric"
+              cursorColor={colors.text}
+              style={[s.input, { color: colors.text }]}
+            />
+            <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+              <Pressable
+                onPress={() => setFormOpen(false)}
+                style={[s.saveBtn, { flex: 1, marginTop: 0, backgroundColor: colors.surfaceRaised, borderWidth: 1, borderColor: colors.border }]}
+              >
+                <Text style={{ color: colors.textMuted, fontWeight: "700" }}>Cancel</Text>
+              </Pressable>
+              <Pressable onPress={handleAdd} style={[s.saveBtn, { flex: 2, marginTop: 0, backgroundColor: colors.notes }]}>
+                <Text style={s.saveBtnText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+      </ScrollView>
+      {!formOpen && (
+        <Pressable
+          style={[s.fab, cardShadow, { backgroundColor: colors.notes, bottom: BOTTOM_INSET + 20 + TAB_BAR_HEIGHT }]}
+          onPress={() => setFormOpen(true)}
+        >
+          <Text style={s.fabText}>+</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
 // ───────────── ROOT APP TABS ─────────────
 const TABS = [
   { key: "home", label: "Home", accent: colors.habitGreen },
   { key: "expenses", label: "Expenses", accent: colors.expense },
   { key: "reports", label: "Reports", accent: colors.expense },
+  { key: "settle", label: "Give/Get", accent: colors.notes },
   { key: "progress", label: "Progress", accent: colors.streakOrange },
   { key: "tasks", label: "Tasks", accent: "#38BDF8" },
   { key: "notes", label: "Notes", accent: colors.notes },
@@ -4826,56 +5226,74 @@ export default function App() {
   }, [request]);
 
   useEffect(() => {
+    if (webOAuthHash.error && !webOAuthHash.token) {
+      setAuthLoading(false);
+      setAuthError(`Google sign-in did not finish (${webOAuthHash.error}). Add ${request?.redirectUri || "this site URL"} as an authorized redirect URI in Google Cloud.`);
+    }
     if (response?.type === "success") {
       const { authentication, params } = response;
       const token = authentication?.accessToken || params?.access_token;
       if (token) {
+        authDecisionLocked = true;
         handleGoogleToken(token);
       }
     } else if (response?.type === "error") {
       setAuthLoading(false);
       setAuthError(response.error?.message || "Google sign-in was cancelled or failed.");
     }
-  }, [response]);
+  }, [response, request?.redirectUri]);
 
   async function handleGoogleToken(token) {
+    if (!token || googleSignInToken === token) return;
+    googleSignInToken = token;
+    authDecisionLocked = true;
     setAuthLoading(true);
     setAuthError(null);
     try {
-      const userRes = await fetch("https://www.googleapis.com/userinfo/v2/me", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const userInfo = userRes.ok ? await userRes.json() : { name: "User", email: "" };
+      await saveAuthData({ token });
+      activeToken = token;
 
-      const sheetId = await createOrFindSpreadsheet(token);
-      if (sheetId) {
-        setSheetsContext(token, sheetId);
+      let userInfo = { name: "User", email: "" };
+      try {
+        const userRes = await fetch("https://www.googleapis.com/userinfo/v2/me", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (userRes.ok) userInfo = await userRes.json();
+      } catch (err) {
+        console.log("[Auth] Could not load Google profile:", err);
       }
 
-      const restoreRes = sheetId ? await restoreAllFromSheets(token, sheetId) : null;
-      const stored = await getStoredAuth();
-      const resolvedGender = restoreRes?.gender || stored.gender;
+      let sheetId = null;
+      let resolvedGender = null;
+      try {
+        sheetId = await createOrFindSpreadsheet(token);
+        if (sheetId) setSheetsContext(token, sheetId);
+        const restoreRes = sheetId ? await restoreAllFromSheets(token, sheetId) : null;
+        const stored = await getStoredAuth();
+        resolvedGender = restoreRes?.gender || stored.gender || null;
+      } catch (err) {
+        console.log("[Auth] Sheets sync failed, continuing with this device:", err);
+        const stored = await getStoredAuth();
+        resolvedGender = stored.gender || null;
+      }
 
       const newAuth = {
         token,
         user: userInfo,
-        gender: resolvedGender || null,
+        gender: resolvedGender,
         sheetId,
       };
 
       await saveAuthData(newAuth);
       setAuthData(newAuth);
-
-      if (resolvedGender) {
-        setAuthStep("main");
-      } else {
-        setAuthStep("gender");
-      }
+      setAuthStep(resolvedGender ? "main" : "gender");
     } catch (e) {
       console.log("[Auth] Error handling Google sign-in:", e);
-      setAuthError("Failed to initialize Google Sheets. Check your network connection.");
+      setAuthError("Google sign-in could not be saved in this browser. Allow site data, then try again.");
+      setAuthStep("login");
     } finally {
       setAuthLoading(false);
+      setReady(true);
     }
   }
 
@@ -4894,8 +5312,21 @@ export default function App() {
           setThemeMode(savedTheme);
         }
       } catch (_) {}
+      if (webOAuthHash.token) {
+        authDecisionLocked = true;
+        await handleGoogleToken(webOAuthHash.token);
+        return;
+      }
+      if (authDecisionLocked) {
+        setReady(true);
+        return;
+      }
       try {
         const stored = await getStoredAuth();
+        if (authDecisionLocked) {
+          setReady(true);
+          return;
+        }
         if (stored.token || stored.user) {
           if (stored.token && stored.sheetId) {
             setSheetsContext(stored.token, stored.sheetId);
@@ -4903,19 +5334,39 @@ export default function App() {
           setAuthData(stored);
           if (stored.gender) {
             setAuthStep("main");
-          } else {
+          } else if (stored.token) {
             setAuthStep("gender");
+          } else {
+            setAuthStep("login");
           }
         } else {
           setAuthStep("login");
         }
       } catch (err) {
         console.warn("[AppInit] Stored auth error:", err);
-        setAuthStep("login");
+        if (!authDecisionLocked) setAuthStep("login");
       }
       setReady(true);
     })();
   }, []);
+
+  useEffect(() => {
+    if (!ready || authStep !== "main") return;
+    checkTaskReminders();
+    const timer = setInterval(checkTaskReminders, 30000);
+    const onVisible = () => {
+      if (typeof document === "undefined" || document.visibilityState === "visible") checkTaskReminders();
+    };
+    if (Platform.OS === "web" && typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisible);
+    }
+    return () => {
+      clearInterval(timer);
+      if (Platform.OS === "web" && typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisible);
+      }
+    };
+  }, [ready, authStep]);
 
   async function handleUpdateUserProfile(updatedUser) {
     const updated = {
@@ -4939,6 +5390,8 @@ export default function App() {
   }
 
   async function handleSignOut() {
+    googleSignInToken = null;
+    authDecisionLocked = false;
     await clearAuthData();
     setAuthData(null);
     setTab("home");
@@ -4984,6 +5437,14 @@ export default function App() {
             setAuthError(null);
             if (GOOGLE_CONFIG.webClientId.includes("YOUR_WEB_CLIENT_ID")) {
               setAuthError("Google OAuth Client ID is not configured yet. Add your Client ID to GOOGLE_CONFIG in App.js or use Demo Login.");
+              return;
+            }
+            if (Platform.OS === "web") {
+              if (!request?.url) {
+                setAuthError("Google sign-in is still starting. Wait a moment and try again.");
+                return;
+              }
+              window.location.assign(request.url);
               return;
             }
             setAuthLoading(true);
@@ -5032,6 +5493,7 @@ export default function App() {
             {tab === "tasks" && <TasksScreen />}
             {tab === "expenses" && <ExpensesScreen focusKey={tab} />}
             {tab === "reports" && <ExpenseReportsScreen />}
+            {tab === "settle" && <SettleScreen />}
             {tab === "progress" && <ProgressScreen />}
             {tab === "notes" && <NotesScreen />}
             {tab === "buy" && <BuyScreen />}
@@ -5631,7 +6093,7 @@ function createAppStyles(colors) {
 
   reportMetricsRow: { flexDirection: "row", justifyContent: "space-between" },
   reportMetricCol: { flex: 1 },
-  reportMetricValue: { fontSize: 15, fontWeight: "800", marginTop: 4 },
+  reportMetricValue: { fontSize: 13, fontWeight: "800", marginTop: 4 },
   reportCard: {
     backgroundColor: colors.surface,
     borderRadius: 18,
