@@ -95,6 +95,7 @@ const LOCAL_ASSETS = {
   note5: require("./assets/note5.jpg"),
   winnie: require("./assets/winnie.jpeg"),
   logo: require("./assets/winnie.jpeg"),
+  uzui: require("./assets/uzui.png"),
 };
 
 const NOTE_IMAGES = [
@@ -1368,8 +1369,17 @@ async function getMonthlyExpenseReport(year, month) {
     [`${prefix}-%`]
   );
 }
-async function getCategorySpendHistory(category) {
+async function getCategorySpendHistory(category, monthPrefix) {
   const db = await getDb();
+  if (monthPrefix) {
+    return db.getAllAsync(
+      `SELECT e.id, e.date, e.title, e.amount
+       FROM expenses e LEFT JOIN tags t ON t.id = e.category_id
+       WHERE e.type = 'expense' AND COALESCE(t.name, 'Uncategorised') = ? AND e.date LIKE ?
+       ORDER BY e.date DESC, e.id DESC`,
+      [category, `${monthPrefix}-%`]
+    );
+  }
   return db.getAllAsync(
     `SELECT e.id, e.date, e.title, e.amount
      FROM expenses e LEFT JOIN tags t ON t.id = e.category_id
@@ -1997,19 +2007,22 @@ function HomeScreen({ onRitualTapped }) {
   const weekDays = getWeekDaysForDate(selectedDate);
   const [rituals, setRituals] = useState([]);
   const [logsMap, setLogsMap] = useState({});
-  const [recentExpenses, setRecentExpenses] = useState([]);
+  const [dayTotals, setDayTotals] = useState({ income: 0, expense: 0 });
+  const [hasActivity, setHasActivity] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [editingRitual, setEditingRitual] = useState(null);
 
   const loadData = useCallback(async () => {
-    const [allRituals, weekLogs, recent] = await Promise.all([
+    const [allRituals, weekLogs, recent, totals] = await Promise.all([
       listRituals(),
       getRitualLogsForDates(weekDays),
       getEntriesForDate(selectedDate),
+      getDayTotals(selectedDate),
     ]);
     setRituals(allRituals);
     setLogsMap(weekLogs);
-    setRecentExpenses(recent);
+    setHasActivity(recent.length > 0);
+    setDayTotals({ income: totals.income ?? 0, expense: totals.expense ?? 0 });
   }, [selectedDate, weekDays]);
 
   useEffect(() => {
@@ -2102,17 +2115,30 @@ function HomeScreen({ onRitualTapped }) {
           </View>
         </View>
 
-        {/* 3. TODAY'S RECENT ENTRIES */}
+        {/* 3. TODAY'S ACTIVITY SUMMARY */}
         <Text style={s.listLabel}>Logged Activity ({formattedSelected}) 📊</Text>
-        {recentExpenses.length === 0 ? (
+        {!hasActivity ? (
           <View style={s.emptyStateContainer}>
             <Image source={APP_ICONS.empty} style={s.emptyIcon} />
             <Text style={s.emptyText}>No activity logged for {formattedSelected.toLowerCase()} yet. ✨</Text>
           </View>
         ) : (
-          recentExpenses.map((entry) => (
-            <EntryCard key={entry.id} entry={entry} interactive={false} showDate onDeleted={loadData} />
-          ))
+          <View style={[s.summaryCard, cardShadow, { marginBottom: 10 }]}>
+            <View style={s.reportMetricsRow}>
+              <View style={s.reportMetricCol}>
+                <Text style={s.balanceLabel}>Income 💵</Text>
+                <Text style={[s.reportMetricValue, { color: colors.positive }]}>
+                  +₹{(dayTotals.income || 0).toFixed(0)}
+                </Text>
+              </View>
+              <View style={[s.reportMetricCol, { alignItems: "flex-end" }]}>
+                <Text style={s.balanceLabel}>Expense 🛍️</Text>
+                <Text style={[s.reportMetricValue, { color: colors.expense }]}>
+                  −₹{(dayTotals.expense || 0).toFixed(0)}
+                </Text>
+              </View>
+            </View>
+          </View>
         )}
       </ScrollView>
 
@@ -2139,16 +2165,19 @@ function ProgressScreen() {
   const [learningOpen, setLearningOpen] = useState(false);
   const [editingLearningId, setEditingLearningId] = useState(null);
   const [savedNote, setSavedNote] = useState(false);
+  const [rituals, setRituals] = useState([]);
 
   const progressDate = todayISO();
 
   const loadData = useCallback(async () => {
-    const [stats, notes] = await Promise.all([
+    const [stats, notes, allRituals] = await Promise.all([
       getProgressStreakStats(),
       listLearningNotes(progressDate),
+      listRituals(),
     ]);
     setStreakStats(stats);
     setLearningNotes(notes);
+    setRituals(allRituals);
   }, [progressDate]);
 
   useEffect(() => {
@@ -2334,7 +2363,7 @@ function ProgressScreen() {
                 <Text style={{ fontSize: 16 }}>🔥</Text>
                 <Text style={{ color: colors.textMuted, fontSize: 12 }}>Streak day</Text>
               </View>
-              <Text style={{ color: colors.textFaint, fontSize: 11 }}>Tap past or today to toggle · future dates stay locked ⚡</Text>
+              <Text style={{ color: colors.textFaint, fontSize: 11 }}>⚡</Text>
             </View>
           </View>
 
@@ -2403,6 +2432,16 @@ function ProgressScreen() {
               </>
             )}
           </View>
+
+          {/* RITUAL CONSISTENCY REPORTS SECTION */}
+          {rituals.length > 0 && (
+            <>
+              <Text style={[s.listLabel, { marginTop: 22 }]}>Ritual Consistency Reports 🗓️</Text>
+              {rituals.map((r) => (
+                <RitualReportCalendar key={r.id} ritual={r} monthDate={monthDate} onToggleDay={loadData} />
+              ))}
+            </>
+          )}
         </ScrollView>
       </KeyboardAvoidingView>
     </View>
@@ -3243,11 +3282,15 @@ function RitualReportCalendar({ ritual, monthDate, onToggleDay }) {
 function ExpenseReportsScreen() {
   const [month, setMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [rows, setRows] = useState([]);
-  const [rituals, setRituals] = useState([]);
   const [summary, setSummary] = useState({ income: 0, expense: 0, carriedForward: 0 });
   const [loading, setLoading] = useState(true);
   const [selectedCategory, setSelectedCategory] = useState(null);
   const [categoryHistory, setCategoryHistory] = useState([]);
+  const [settleItems, setSettleItems] = useState([]);
+  const [settleFormOpen, setSettleFormOpen] = useState(false);
+  const [settlePerson, setSettlePerson] = useState("");
+  const [settleAmount, setSettleAmount] = useState("");
+  const [settleDirection, setSettleDirection] = useState("give");
 
   const spinAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -3288,15 +3331,15 @@ function ExpenseReportsScreen() {
     const year = month.getFullYear();
     const monthIndex = month.getMonth();
     const monthStart = `${year}-${String(monthIndex + 1).padStart(2, "0")}-01`;
-    const [monthSummary, reportRows, allRituals, carriedForward] = await Promise.all([
+    const [monthSummary, reportRows, carriedForward, settlements] = await Promise.all([
       getMonthlySummary(year, monthIndex),
       getMonthlyExpenseReport(year, monthIndex),
-      listRituals(),
       getCarriedForwardBalance(monthStart),
+      listSettlements(),
     ]);
     setSummary({ ...monthSummary, carriedForward });
     setRows(reportRows);
-    setRituals(allRituals);
+    setSettleItems(settlements);
     setLoading(false);
   }, [month]);
 
@@ -3308,25 +3351,76 @@ function ExpenseReportsScreen() {
     setSelectedCategory(null);
   }, [month]);
 
+  const monthPrefix = `${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, "0")}`;
+
   useEffect(() => {
     if (!selectedCategory) {
       setCategoryHistory([]);
       return;
     }
     let cancelled = false;
-    getCategorySpendHistory(selectedCategory).then((history) => {
+    getCategorySpendHistory(selectedCategory, monthPrefix).then((history) => {
       if (!cancelled) setCategoryHistory(history);
     });
     return () => {
       cancelled = true;
     };
-  }, [selectedCategory]);
+  }, [selectedCategory, monthPrefix]);
 
   const max = Math.max(...rows.map((row) => row.total), 1);
   const monthName = month.toLocaleDateString("en-US", { month: "long", year: "numeric" });
   const nextMonth = () => setMonth((d) => new Date(d.getFullYear(), d.getMonth() + 1, 1));
   const prevMonth = () => setMonth((d) => new Date(d.getFullYear(), d.getMonth() - 1, 1));
   const netSavings = summary.income - summary.expense;
+
+  const giveItems = settleItems.filter((item) => item.direction === "give");
+  const getItems = settleItems.filter((item) => item.direction === "get");
+  const giveTotal = giveItems.reduce((sum, item) => sum + Number(item.amount), 0);
+  const getTotal = getItems.reduce((sum, item) => sum + Number(item.amount), 0);
+
+  async function handleSettleAdd() {
+    const amountNum = Number(settleAmount);
+    if (!settlePerson.trim() || !amountNum) return;
+    await addSettlement({ direction: settleDirection, person: settlePerson.trim(), amount: amountNum });
+    setSettlePerson("");
+    setSettleAmount("");
+    setSettleFormOpen(false);
+    const updated = await listSettlements();
+    setSettleItems(updated);
+  }
+
+  function renderSettleGroup(title, groupRows, tint) {
+    return (
+      <View style={{ marginTop: 4 }}>
+        <Text style={[s.balanceLabel, { marginBottom: 6, marginTop: 12 }]}>{title}</Text>
+        {groupRows.length === 0 ? (
+          <Text style={s.dateSub}>Nothing here yet.</Text>
+        ) : (
+          groupRows.map((item) => (
+            <View key={item.id} style={[s.summaryCard, { marginBottom: 8, paddingVertical: 12 }]}>
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.entryTitle}>{item.person}</Text>
+                  {item.note ? <Text style={s.dateSub}>{item.note}</Text> : null}
+                </View>
+                <Text style={{ color: tint, fontWeight: "800", fontSize: 16 }}>₹{Number(item.amount).toFixed(0)}</Text>
+                <Pressable
+                  onPress={async () => {
+                    await deleteSettlement(item.id);
+                    const updated = await listSettlements();
+                    setSettleItems(updated);
+                  }}
+                  hitSlop={8}
+                >
+                  <Text style={s.entryDeleteX}>×</Text>
+                </Pressable>
+              </View>
+            </View>
+          ))
+        )}
+      </View>
+    );
+  }
 
   return (
     <View style={s.screen}>
@@ -3444,11 +3538,14 @@ function ExpenseReportsScreen() {
               />
               {selectedCategory ? (
                 <View style={{ marginTop: 16, width: "100%" }}>
-                  <Text style={[s.entryTitle, { marginBottom: 8 }]}>
-                    {selectedCategory} history
+                  <Text style={[s.entryTitle, { marginBottom: 4 }]}>
+                    {selectedCategory} — {monthName}
+                  </Text>
+                  <Text style={[s.dateSub, { marginBottom: 8 }]}>
+                    Total: ₹{rows.find((r) => r.category === selectedCategory)?.total?.toFixed(0) ?? "0"}
                   </Text>
                   {categoryHistory.length === 0 ? (
-                    <Text style={s.dateSub}>No spending recorded for this category yet.</Text>
+                    <Text style={s.dateSub}>No spending recorded for this category this month.</Text>
                   ) : (
                     categoryHistory.map((entry) => (
                       <View
@@ -3474,17 +3571,86 @@ function ExpenseReportsScreen() {
                 </View>
               ) : (
                 <Text style={[s.dateSub, { marginTop: 12, textAlign: "center" }]}>
-                  Tap a category to see every date and amount.
+                  Tap a category to see every date and amount for {monthName}.
                 </Text>
               )}
             </View>
-
-            {/* RITUAL CONSISTENCY REPORT SECTION */}
-            <Text style={s.listLabel}>Ritual Consistency Reports 🗓️</Text>
-            {rituals.map((r) => (
-              <RitualReportCalendar key={r.id} ritual={r} monthDate={month} onToggleDay={load} />
-            ))}
           </>
+        )}
+
+        {/* GIVE / GET SECTION INLINE IN REPORTS */}
+        <Text style={s.listLabel}>Give & Get 💸</Text>
+        <View style={[s.summaryCard, cardShadow, { marginBottom: 8 }]}>
+          <View style={s.reportMetricsRow}>
+            <View style={s.reportMetricCol}>
+              <Text style={s.balanceLabel}>To give</Text>
+              <Text style={[s.reportMetricValue, { color: colors.negative }]}>₹{giveTotal.toFixed(0)}</Text>
+            </View>
+            <View style={[s.reportMetricCol, { alignItems: "flex-end" }]}>
+              <Text style={s.balanceLabel}>To get</Text>
+              <Text style={[s.reportMetricValue, { color: colors.positive }]}>₹{getTotal.toFixed(0)}</Text>
+            </View>
+          </View>
+        </View>
+
+        {renderSettleGroup("Give 💸", giveItems, colors.negative)}
+        {renderSettleGroup("Get 💰", getItems, colors.positive)}
+
+        {settleFormOpen && (
+          <View style={[s.summaryCard, cardShadow, { marginTop: 16 }]}>
+            <View style={s.segment}>
+              <Pressable
+                onPress={() => setSettleDirection("give")}
+                style={[s.segmentBtn, settleDirection === "give" && { backgroundColor: colors.negative }]}
+              >
+                <Text style={[s.segmentText, settleDirection === "give" && s.segmentTextActive]}>Give</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setSettleDirection("get")}
+                style={[s.segmentBtn, settleDirection === "get" && { backgroundColor: colors.positive }]}
+              >
+                <Text style={[s.segmentText, settleDirection === "get" && s.segmentTextActive]}>Get</Text>
+              </Pressable>
+            </View>
+            <Text style={s.label}>Person</Text>
+            <TextInput
+              value={settlePerson}
+              onChangeText={setSettlePerson}
+              placeholder="Friend's name"
+              placeholderTextColor={colors.textFaint}
+              cursorColor={colors.text}
+              style={[s.input, { color: colors.text }]}
+            />
+            <Text style={s.label}>Amount (₹)</Text>
+            <TextInput
+              value={settleAmount}
+              onChangeText={setSettleAmount}
+              placeholder="0"
+              placeholderTextColor={colors.textFaint}
+              keyboardType="numeric"
+              cursorColor={colors.text}
+              style={[s.input, { color: colors.text }]}
+            />
+            <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+              <Pressable
+                onPress={() => setSettleFormOpen(false)}
+                style={[s.saveBtn, { flex: 1, marginTop: 0, backgroundColor: colors.surfaceRaised, borderWidth: 1, borderColor: colors.border }]}
+              >
+                <Text style={{ color: colors.textMuted, fontWeight: "700" }}>Cancel</Text>
+              </Pressable>
+              <Pressable onPress={handleSettleAdd} style={[s.saveBtn, { flex: 2, marginTop: 0, backgroundColor: colors.notes }]}>
+                <Text style={s.saveBtnText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+        {!settleFormOpen && (
+          <Pressable
+            style={[s.saveBtn, { backgroundColor: colors.notes, marginTop: 16, marginBottom: 8 }]}
+            onPress={() => setSettleFormOpen(true)}
+          >
+            <Text style={s.saveBtnText}>+ Add Give/Get Entry</Text>
+          </Pressable>
         )}
       </ScrollView>
     </View>
@@ -3716,8 +3882,22 @@ function BuyScreen() {
         contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 100 + TAB_BAR_HEIGHT }}
         keyboardShouldPersistTaps="handled"
       >
+        {/* HERO BANNER FOR BUY LIST */}
+        <View style={s.bannerCard}>
+          <EditableImage
+            imageKey="banner_buy"
+            defaultSource={LOCAL_ASSETS.uzui}
+            style={s.bannerImage}
+            resizeMode="contain"
+          />
+          <View style={s.bannerOverlay}>
+            <Text style={s.bannerTitle}>Flashy Shopping ✨</Text>
+            <Text style={s.bannerSub}>Prioritize your wishlist in extravagant style 💎</Text>
+          </View>
+        </View>
+
         {/* Balance card */}
-        <View style={[s.summaryCard, cardShadow, { marginTop: 10, marginBottom: 4 }]}>
+        <View style={[s.summaryCard, cardShadow, { marginTop: 16, marginBottom: 4 }]}>
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <View>
               <Text style={s.balanceLabel}>ACCOUNT BALANCE 💳</Text>
@@ -4872,159 +5052,11 @@ function NotesScreen() {
   );
 }
 
-// ───────────── GIVE / GET ─────────────
-function SettleScreen() {
-  const [items, setItems] = useState([]);
-  const [person, setPerson] = useState("");
-  const [amount, setAmount] = useState("");
-  const [direction, setDirection] = useState("give");
-  const [formOpen, setFormOpen] = useState(false);
-
-  const load = useCallback(async () => {
-    setItems(await listSettlements());
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  async function handleAdd() {
-    const amountNum = Number(amount);
-    if (!person.trim() || !amountNum) return;
-    await addSettlement({ direction, person, amount: amountNum });
-    setPerson("");
-    setAmount("");
-    setFormOpen(false);
-    load();
-  }
-
-  const giveItems = items.filter((item) => item.direction === "give");
-  const getItems = items.filter((item) => item.direction === "get");
-  const giveTotal = giveItems.reduce((sum, item) => sum + Number(item.amount), 0);
-  const getTotal = getItems.reduce((sum, item) => sum + Number(item.amount), 0);
-
-  function renderGroup(title, rows, tint) {
-    return (
-      <View style={{ marginTop: 16 }}>
-        <Text style={s.listLabel}>{title}</Text>
-        {rows.length === 0 ? (
-          <Text style={s.dateSub}>Nothing here yet.</Text>
-        ) : (
-          rows.map((item) => (
-            <View key={item.id} style={[s.summaryCard, { marginBottom: 8, paddingVertical: 12 }]}>
-              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-                <View style={{ flex: 1 }}>
-                  <Text style={s.entryTitle}>{item.person}</Text>
-                  {item.note ? <Text style={s.dateSub}>{item.note}</Text> : null}
-                </View>
-                <Text style={{ color: tint, fontWeight: "800", fontSize: 16 }}>₹{Number(item.amount).toFixed(0)}</Text>
-                <Pressable
-                  onPress={async () => {
-                    await deleteSettlement(item.id);
-                    load();
-                  }}
-                  hitSlop={8}
-                >
-                  <Text style={s.entryDeleteX}>×</Text>
-                </Pressable>
-              </View>
-            </View>
-          ))
-        )}
-      </View>
-    );
-  }
-
-  return (
-    <View style={s.screen}>
-      <ScreenHeader title="Give & Get" iconKey="settle" />
-      <ScrollView
-        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 100 + TAB_BAR_HEIGHT }}
-        keyboardShouldPersistTaps="handled"
-      >
-        <View style={[s.summaryCard, cardShadow, { marginTop: 12 }]}>
-          <View style={s.reportMetricsRow}>
-            <View style={s.reportMetricCol}>
-              <Text style={s.balanceLabel}>To give</Text>
-              <Text style={[s.reportMetricValue, { color: colors.negative }]}>₹{giveTotal.toFixed(0)}</Text>
-            </View>
-            <View style={[s.reportMetricCol, { alignItems: "flex-end" }]}>
-              <Text style={s.balanceLabel}>To get</Text>
-              <Text style={[s.reportMetricValue, { color: colors.positive }]}>₹{getTotal.toFixed(0)}</Text>
-            </View>
-          </View>
-        </View>
-
-        {renderGroup("Give", giveItems, colors.negative)}
-        {renderGroup("Get", getItems, colors.positive)}
-
-        {formOpen && (
-          <View style={[s.summaryCard, cardShadow, { marginTop: 16 }]}>
-            <View style={s.segment}>
-              <Pressable
-                onPress={() => setDirection("give")}
-                style={[s.segmentBtn, direction === "give" && { backgroundColor: colors.negative }]}
-              >
-                <Text style={[s.segmentText, direction === "give" && s.segmentTextActive]}>Give</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => setDirection("get")}
-                style={[s.segmentBtn, direction === "get" && { backgroundColor: colors.positive }]}
-              >
-                <Text style={[s.segmentText, direction === "get" && s.segmentTextActive]}>Get</Text>
-              </Pressable>
-            </View>
-            <Text style={s.label}>Person</Text>
-            <TextInput
-              value={person}
-              onChangeText={setPerson}
-              placeholder="Friend's name"
-              placeholderTextColor={colors.textFaint}
-              cursorColor={colors.text}
-              style={[s.input, { color: colors.text }]}
-            />
-            <Text style={s.label}>Amount (₹)</Text>
-            <TextInput
-              value={amount}
-              onChangeText={setAmount}
-              placeholder="0"
-              placeholderTextColor={colors.textFaint}
-              keyboardType="numeric"
-              cursorColor={colors.text}
-              style={[s.input, { color: colors.text }]}
-            />
-            <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
-              <Pressable
-                onPress={() => setFormOpen(false)}
-                style={[s.saveBtn, { flex: 1, marginTop: 0, backgroundColor: colors.surfaceRaised, borderWidth: 1, borderColor: colors.border }]}
-              >
-                <Text style={{ color: colors.textMuted, fontWeight: "700" }}>Cancel</Text>
-              </Pressable>
-              <Pressable onPress={handleAdd} style={[s.saveBtn, { flex: 2, marginTop: 0, backgroundColor: colors.notes }]}>
-                <Text style={s.saveBtnText}>Save</Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-      </ScrollView>
-      {!formOpen && (
-        <Pressable
-          style={[s.fab, cardShadow, { backgroundColor: colors.notes, bottom: BOTTOM_INSET + 20 + TAB_BAR_HEIGHT }]}
-          onPress={() => setFormOpen(true)}
-        >
-          <Text style={s.fabText}>+</Text>
-        </Pressable>
-      )}
-    </View>
-  );
-}
-
 // ───────────── ROOT APP TABS ─────────────
 const TABS = [
   { key: "home", label: "Home", accent: colors.habitGreen },
   { key: "expenses", label: "Expenses", accent: colors.expense },
   { key: "reports", label: "Reports", accent: colors.expense },
-  { key: "settle", label: "Give/Get", accent: colors.notes },
   { key: "progress", label: "Progress", accent: colors.streakOrange },
   { key: "tasks", label: "Tasks", accent: "#38BDF8" },
   { key: "notes", label: "Notes", accent: colors.notes },
@@ -5493,7 +5525,6 @@ export default function App() {
             {tab === "tasks" && <TasksScreen />}
             {tab === "expenses" && <ExpensesScreen focusKey={tab} />}
             {tab === "reports" && <ExpenseReportsScreen />}
-            {tab === "settle" && <SettleScreen />}
             {tab === "progress" && <ProgressScreen />}
             {tab === "notes" && <NotesScreen />}
             {tab === "buy" && <BuyScreen />}
