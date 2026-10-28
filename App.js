@@ -25,12 +25,15 @@ import {
   FlatList,
   Modal,
   KeyboardAvoidingView,
+  Keyboard,
   Platform,
   Animated,
   PanResponder,
   StatusBar,
   Alert,
   Image,
+  AppState,
+  Switch,
 } from "react-native";
 import * as SQLite from "expo-sqlite";
 import Svg, { Circle } from "react-native-svg";
@@ -202,22 +205,17 @@ function hslToHex(h, satPercent, lightPercent) {
   return `#${channel(0)}${channel(8)}${channel(4)}`;
 }
 
-// Golden-angle hues keep every slice visually distinct past 15 categories.
-// The previous palette recycled the same five hue families.
-const CHART_COLOR_COUNT = 24;
-const CHART_COLORS = Array.from({ length: CHART_COLOR_COUNT }, (_, index) => {
-  const hue = (index * 137.508) % 360;
-  const sat = index % 2 === 0 ? 84 : 70;
-  const light = index % 3 === 0 ? 46 : index % 3 === 1 ? 58 : 40;
-  return hslToHex(hue, sat, light);
-});
+const CHART_COLORS = [
+  "#F4B6C2", "#F6C9A8", "#F6E3A1", "#D5E7A3", "#B7E0C2", "#A9DDD4",
+  "#A9D4EA", "#B7C6F0", "#D0B8F0", "#E7C2EA", "#F3B7D4", "#F2C1B0",
+  "#E6D4A8", "#C9DDB4", "#A8D8C8", "#A8CDE4", "#C2B6E8", "#E8C4D8",
+  "#F0D0B4", "#DDE6B0", "#B8E0D4", "#C4D4F2", "#E0C8F0", "#F6D6C8",
+];
 
 function chartColorAt(index) {
   if (index < CHART_COLORS.length) return CHART_COLORS[index];
-  const hue = (index * 137.508) % 360;
-  const sat = 66 + (index % 3) * 8;
-  const light = 40 + (index % 4) * 5;
-  return hslToHex(hue, sat, light);
+  const hue = (index * 24) % 360;
+  return hslToHex(hue, 42, 78);
 }
 
 function isFutureDate(dateStr) {
@@ -333,6 +331,7 @@ const STORAGE_KEYS = {
   THEME: "@winnie_theme_mode",
   NOTIFICATIONS: "@winnie_notifications",
   NOTIFIED_SLOTS: "@winnie_notified_slots",
+  INCLUDE_DEBTS: "@winnie_include_debts",
 };
 
 export async function getStoredAuth() {
@@ -1128,6 +1127,7 @@ async function addTask({ title, description = "", dueDate = todayISO(), dueTime 
     [title.trim(), description.trim(), dueDate, dueTime, priority, category, repeat, googleEventId]
   );
   triggerTableSync("tasks");
+  checkTaskReminders().catch(() => {});
   return res.lastInsertRowId;
 }
 
@@ -1151,6 +1151,7 @@ async function updateTask(id, { title, description, dueDate, dueTime, priority, 
     [title.trim(), description.trim(), dueDate, dueTime, priority, category, repeat, newGoogleId || googleEventId, id]
   );
   triggerTableSync("tasks");
+  checkTaskReminders().catch(() => {});
 }
 
 async function toggleTask(id) {
@@ -1166,6 +1167,7 @@ async function toggleTask(id) {
     await db.runAsync(`UPDATE tasks SET completed = CASE WHEN completed = 0 THEN 1 ELSE 0 END WHERE id = ?`, [id]);
   }
   triggerTableSync("tasks");
+  checkTaskReminders().catch(() => {});
 }
 
 async function deleteTask(id, googleEventId) {
@@ -1229,8 +1231,36 @@ async function showReminder(title, body) {
   }
 }
 
+const reminderTimers = new Map();
+const REMINDER_CATCH_UP_MS = 7 * 24 * 60 * 60 * 1000;
+
+function appIsForeground() {
+  if (Platform.OS === "web") {
+    return typeof document === "undefined" || document.visibilityState !== "hidden";
+  }
+  return AppState.currentState === "active";
+}
+
+function taskDueMs(task) {
+  const time = String(task.due_time || "09:00").slice(0, 5);
+  const [hour, minute] = time.split(":").map((part) => Number(part));
+  const [year, month, day] = String(task.due_date || "").split("-").map((part) => Number(part));
+  if (!year || !month || !day || Number.isNaN(hour) || Number.isNaN(minute)) return NaN;
+  return new Date(year, month - 1, day, hour, minute, 0, 0).getTime();
+}
+
+function clearReminderTimers() {
+  for (const timer of reminderTimers.values()) clearTimeout(timer);
+  reminderTimers.clear();
+}
+
+async function rememberNotified(notified) {
+  await AsyncStorage.setItem(STORAGE_KEYS.NOTIFIED_SLOTS, JSON.stringify(notified));
+}
+
 async function checkTaskReminders() {
   if (!(await notificationsAreEnabled())) return;
+  if (Platform.OS === "web") requestNotificationPermission().catch(() => {});
   let tasks = [];
   try {
     tasks = await listTasks();
@@ -1244,32 +1274,64 @@ async function checkTaskReminders() {
   } catch {
     notified = {};
   }
+  clearReminderTimers();
   let changed = false;
+  const pending = [];
   for (const task of tasks) {
     if (task.completed) continue;
-    const due = new Date(`${task.due_date}T${(task.due_time || "09:00").slice(0, 5)}:00`).getTime();
+    const due = taskDueMs(task);
     if (Number.isNaN(due)) continue;
     const slots = [
-      { id: `${task.id}:15`, at: due - 15 * 60 * 1000, title: "In 15 minutes", body: task.title },
-      { id: `${task.id}:0`, at: due, title: "Reminder", body: task.title },
+      { id: `${task.id}:${task.due_date}:15`, at: due - 15 * 60 * 1000, title: "In 15 minutes", body: task.title },
+      { id: `${task.id}:${task.due_date}:0`, at: due, title: task.title, body: "It's time for this reminder." },
     ];
     for (const slot of slots) {
       if (notified[slot.id]) continue;
-      if (now >= slot.at && now - slot.at < 20 * 60 * 1000) {
-        await showReminder(slot.title, slot.body);
-        notified[slot.id] = now;
-        changed = true;
+      const delay = slot.at - now;
+      if (delay <= 0 && now - slot.at < REMINDER_CATCH_UP_MS) {
+        pending.push(slot);
+      } else if (delay > 0 && delay < 24 * 60 * 60 * 1000) {
+        const timer = setTimeout(() => {
+          if (!appIsForeground()) return;
+          showReminder(slot.title, slot.body);
+          notified[slot.id] = Date.now();
+          rememberNotified(notified).catch(() => {});
+        }, delay);
+        reminderTimers.set(slot.id, timer);
       }
     }
   }
-  if (changed) {
-    await AsyncStorage.setItem(STORAGE_KEYS.NOTIFIED_SLOTS, JSON.stringify(notified));
+  if (pending.length && appIsForeground()) {
+    if (pending.length === 1) {
+      await showReminder(pending[0].title, pending[0].body);
+    } else {
+      await showReminder(
+        "Reminders",
+        pending
+          .map((slot) => (slot.body && slot.body !== slot.title ? `${slot.title} — ${slot.body}` : slot.title))
+          .join("\n")
+      );
+    }
+    for (const slot of pending) notified[slot.id] = now;
+    changed = true;
   }
+  if (changed) await rememberNotified(notified);
 }
 
 async function listSettlements() {
   const db = await getDb();
-  return db.getAllAsync(`SELECT * FROM settlements WHERE settled = 0 ORDER BY direction ASC, person COLLATE NOCASE ASC, id ASC`);
+  return db.getAllAsync(
+    `SELECT * FROM settlements ORDER BY settled ASC, direction ASC, person COLLATE NOCASE ASC, id ASC`
+  );
+}
+
+async function toggleSettlement(id) {
+  const db = await getDb();
+  await db.runAsync(
+    `UPDATE settlements SET settled = CASE WHEN settled = 0 THEN 1 ELSE 0 END WHERE id = ?`,
+    [id]
+  );
+  triggerTableSync("settlements");
 }
 
 async function addSettlement({ direction, person, amount, note = "" }) {
@@ -1893,6 +1955,7 @@ const EMOJI_SUGGESTIONS = ["🏃", "📚", "🥗", "💧", "🧘", "🚶", "💊
 function RitualModal({ visible, editingRitual, onClose, onSaved, onDeleted }) {
   const [name, setName] = useState("");
   const [emoji, setEmoji] = useState("✨");
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
   const isEditing = !!editingRitual;
 
   useEffect(() => {
@@ -1904,8 +1967,23 @@ function RitualModal({ visible, editingRitual, onClose, onSaved, onDeleted }) {
         setName("");
         setEmoji("✨");
       }
+    } else {
+      setKeyboardHeight(0);
     }
   }, [visible, editingRitual]);
+
+  useEffect(() => {
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const showSub = Keyboard.addListener(showEvent, (event) => {
+      setKeyboardHeight(event.endCoordinates?.height || 0);
+    });
+    const hideSub = Keyboard.addListener(hideEvent, () => setKeyboardHeight(0));
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
 
   async function handleSave() {
     if (!name.trim()) return;
@@ -1935,60 +2013,72 @@ function RitualModal({ visible, editingRitual, onClose, onSaved, onDeleted }) {
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <Pressable style={s.modalBackdrop} onPress={onClose} />
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={s.sheetWrap}>
-        <View style={s.sheet}>
-          <View style={s.grabber} />
-          <Text style={s.modalHeaderTitle}>{isEditing ? "Edit Ritual ✏️" : "New Daily Ritual ✨"}</Text>
+      <View style={{ flex: 1, justifyContent: "flex-end", paddingBottom: keyboardHeight }}>
+        <Pressable style={{ flex: 1 }} onPress={onClose} />
+        <ScrollView
+          style={{ maxHeight: keyboardHeight ? "78%" : "88%", flexGrow: 0 }}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator
+          nestedScrollEnabled
+          contentContainerStyle={{ paddingBottom: 4 }}
+        >
+          <View style={[s.sheet, { paddingBottom: BOTTOM_INSET + 16 }]}>
+            <View style={s.grabber} />
+            <Text style={s.modalHeaderTitle}>{isEditing ? "Edit Ritual ✏️" : "New Daily Ritual ✨"}</Text>
 
-          <Text style={s.label}>Ritual Name 📝</Text>
-          <TextInput
-            value={name}
-            onChangeText={setName}
-            placeholder="e.g. Drink 2L Water, Read 20 mins"
-            placeholderTextColor={colors.textFaint}
-            style={s.input}
-          />
-
-          <Text style={s.label}>Icon / Emoji 🎨</Text>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-            <View style={[s.emojiPreviewBox, cardShadow]}>
-              <Text style={{ fontSize: 30 }}>{emoji || "✨"}</Text>
-            </View>
+            <Text style={s.label}>Ritual Name 📝</Text>
             <TextInput
-              value={emoji}
-              onChangeText={setEmoji}
-              placeholder="Type any emoji"
+              value={name}
+              onChangeText={setName}
+              placeholder="e.g. Drink 2L Water, Read 20 mins"
               placeholderTextColor={colors.textFaint}
-              style={[s.input, { flex: 1 }]}
-              maxLength={4}
+              cursorColor={colors.text}
+              selectionColor={colors.habitGreen}
+              style={[s.input, { color: colors.text }]}
             />
-          </View>
 
-          <Text style={s.label}>Quick suggestions 💡</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flexDirection: "row", marginVertical: 6 }}>
-            {EMOJI_SUGGESTIONS.map((em) => (
-              <Pressable
-                key={em}
-                onPress={() => setEmoji(em)}
-                style={[s.emojiPill, emoji === em && { borderColor: colors.habitGreen, backgroundColor: colors.surfaceHighlight }]}
-              >
-                <Text style={{ fontSize: 20 }}>{em}</Text>
-              </Pressable>
-            ))}
-          </ScrollView>
+            <Text style={s.label}>Icon / Emoji 🎨</Text>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+              <View style={[s.emojiPreviewBox, cardShadow]}>
+                <Text style={{ fontSize: 30 }}>{emoji || "✨"}</Text>
+              </View>
+              <TextInput
+                value={emoji}
+                onChangeText={setEmoji}
+                placeholder="Type any emoji"
+                placeholderTextColor={colors.textFaint}
+                cursorColor={colors.text}
+                selectionColor={colors.habitGreen}
+                style={[s.input, { flex: 1, color: colors.text }]}
+                maxLength={4}
+              />
+            </View>
 
-          <Pressable onPress={handleSave} style={[s.saveBtn, { backgroundColor: colors.habitGreen }]}>
-            <Text style={s.saveBtnText}>{isEditing ? "Update Ritual 🚀" : "Add Ritual ➕"}</Text>
-          </Pressable>
+            <Text style={s.label}>Quick suggestions 💡</Text>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", marginVertical: 6 }}>
+              {EMOJI_SUGGESTIONS.map((em) => (
+                <Pressable
+                  key={em}
+                  onPress={() => setEmoji(em)}
+                  style={[s.emojiPill, emoji === em && { borderColor: colors.habitGreen, backgroundColor: colors.surfaceHighlight }]}
+                >
+                  <Text style={{ fontSize: 20 }}>{em}</Text>
+                </Pressable>
+              ))}
+            </View>
 
-          {isEditing && (
-            <Pressable onPress={handleDelete} style={{ marginTop: 12, alignItems: "center", paddingVertical: 10 }}>
-              <Text style={{ color: colors.negative, fontWeight: "600" }}>Delete this ritual 🗑️</Text>
+            <Pressable onPress={handleSave} style={[s.saveBtn, { backgroundColor: colors.habitGreen }]}>
+              <Text style={s.saveBtnText}>{isEditing ? "Update Ritual 🚀" : "Add Ritual ➕"}</Text>
             </Pressable>
-          )}
-        </View>
-      </KeyboardAvoidingView>
+
+            {isEditing && (
+              <Pressable onPress={handleDelete} style={{ marginTop: 12, alignItems: "center", paddingVertical: 10 }}>
+                <Text style={{ color: colors.negative, fontWeight: "600" }}>Delete this ritual 🗑️</Text>
+              </Pressable>
+            )}
+          </View>
+        </ScrollView>
+      </View>
     </Modal>
   );
 }
@@ -3035,8 +3125,6 @@ function DonutChart({ rows, selectedCategory = null, onSelectCategory }) {
   const total = rows.reduce((sum, row) => sum + row.total, 0);
   const radius = 52;
   const circumference = 2 * Math.PI * radius;
-  const GAP_DEG = rows.length > 1 ? 4 : 0;
-  const gapLength = (GAP_DEG / 360) * circumference;
   const selectedIdxRaw = rows.findIndex((row) => row.category === selectedCategory);
   const selectedIdx = selectedIdxRaw >= 0 ? selectedIdxRaw : null;
 
@@ -3063,12 +3151,11 @@ function DonutChart({ rows, selectedCategory = null, onSelectCategory }) {
     return () => cancelAnimationFrame(animId);
   }, [rows]);
 
-  // Build segments with gap subtracted so slices never touch or bleed
   const segments = rows.map((row) => {
     const fraction = total ? row.total / total : 0;
     const sliceLength = fraction * circumference;
     const animatedSlice = sliceLength * loadProgress;
-    const drawnLength = Math.max(0, animatedSlice - gapLength * loadProgress);
+    const drawnLength = rows.length > 1 && animatedSlice > 0 ? animatedSlice + 1.6 : animatedSlice;
     return { ...row, fraction, sliceLength: animatedSlice, drawnLength };
   });
 
@@ -3082,7 +3169,7 @@ function DonutChart({ rows, selectedCategory = null, onSelectCategory }) {
       <View style={s.donutWrap}>
         <Svg width={170} height={170} viewBox="0 0 142 142">
           {/* Background track ring */}
-          <Circle cx="71" cy="71" r={radius} stroke={colors.surfaceRaised} strokeWidth="22" fill="none" />
+          <Circle cx="71" cy="71" r={radius} stroke={colors.surfaceRaised} strokeWidth="20" fill="none" />
           {segments.map((seg, index) => {
             const offset = -cumulativeOffset;
             cumulativeOffset += seg.sliceLength;
@@ -3291,6 +3378,8 @@ function ExpenseReportsScreen() {
   const [settlePerson, setSettlePerson] = useState("");
   const [settleAmount, setSettleAmount] = useState("");
   const [settleDirection, setSettleDirection] = useState("give");
+  const [accountBalance, setAccountBalance] = useState(0);
+  const [includeDebts, setIncludeDebts] = useState(false);
 
   const spinAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -3331,15 +3420,17 @@ function ExpenseReportsScreen() {
     const year = month.getFullYear();
     const monthIndex = month.getMonth();
     const monthStart = `${year}-${String(monthIndex + 1).padStart(2, "0")}-01`;
-    const [monthSummary, reportRows, carriedForward, settlements] = await Promise.all([
+    const [monthSummary, reportRows, carriedForward, settlements, balance] = await Promise.all([
       getMonthlySummary(year, monthIndex),
       getMonthlyExpenseReport(year, monthIndex),
       getCarriedForwardBalance(monthStart),
       listSettlements(),
+      getTotalAccountBalance(),
     ]);
     setSummary({ ...monthSummary, carriedForward });
     setRows(reportRows);
     setSettleItems(settlements);
+    setAccountBalance(balance || 0);
     setLoading(false);
   }, [month]);
 
@@ -3367,16 +3458,23 @@ function ExpenseReportsScreen() {
     };
   }, [selectedCategory, monthPrefix]);
 
-  const max = Math.max(...rows.map((row) => row.total), 1);
   const monthName = month.toLocaleDateString("en-US", { month: "long", year: "numeric" });
   const nextMonth = () => setMonth((d) => new Date(d.getFullYear(), d.getMonth() + 1, 1));
   const prevMonth = () => setMonth((d) => new Date(d.getFullYear(), d.getMonth() - 1, 1));
   const netSavings = summary.income - summary.expense;
 
-  const giveItems = settleItems.filter((item) => item.direction === "give");
-  const getItems = settleItems.filter((item) => item.direction === "get");
+  const giveItems = settleItems.filter((item) => item.direction === "give" && !item.settled);
+  const getItems = settleItems.filter((item) => item.direction === "get" && !item.settled);
+  const doneSettleItems = settleItems.filter((item) => item.settled);
   const giveTotal = giveItems.reduce((sum, item) => sum + Number(item.amount), 0);
   const getTotal = getItems.reduce((sum, item) => sum + Number(item.amount), 0);
+  const balanceAfterDebts = accountBalance - giveTotal + getTotal;
+
+  useEffect(() => {
+    AsyncStorage.getItem(STORAGE_KEYS.INCLUDE_DEBTS)
+      .then((value) => setIncludeDebts(value === "on"))
+      .catch(() => {});
+  }, []);
 
   async function handleSettleAdd() {
     const amountNum = Number(settleAmount);
@@ -3389,6 +3487,12 @@ function ExpenseReportsScreen() {
     setSettleItems(updated);
   }
 
+  async function refreshSettlements() {
+    const [updated, balance] = await Promise.all([listSettlements(), getTotalAccountBalance()]);
+    setSettleItems(updated);
+    setAccountBalance(balance || 0);
+  }
+
   function renderSettleGroup(title, groupRows, tint) {
     return (
       <View style={{ marginTop: 4 }}>
@@ -3398,17 +3502,41 @@ function ExpenseReportsScreen() {
         ) : (
           groupRows.map((item) => (
             <View key={item.id} style={[s.summaryCard, { marginBottom: 8, paddingVertical: 12 }]}>
-              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                <Pressable
+                  onPress={async () => {
+                    await toggleSettlement(item.id);
+                    refreshSettlements();
+                  }}
+                  style={[s.buyCheckbox, item.settled && s.buyCheckboxCompleted]}
+                >
+                  {!!item.settled && <Text style={s.buyCheckmark}>✓</Text>}
+                </Pressable>
                 <View style={{ flex: 1 }}>
-                  <Text style={s.entryTitle}>{item.person}</Text>
+                  <Text
+                    style={[
+                      s.entryTitle,
+                      item.settled && { color: colors.textFaint, textDecorationLine: "line-through" },
+                    ]}
+                  >
+                    {item.person}
+                  </Text>
                   {item.note ? <Text style={s.dateSub}>{item.note}</Text> : null}
                 </View>
-                <Text style={{ color: tint, fontWeight: "800", fontSize: 16 }}>₹{Number(item.amount).toFixed(0)}</Text>
+                <Text
+                  style={{
+                    color: item.settled ? colors.textFaint : tint,
+                    fontWeight: "800",
+                    fontSize: 16,
+                    textDecorationLine: item.settled ? "line-through" : "none",
+                  }}
+                >
+                  ₹{Number(item.amount).toFixed(0)}
+                </Text>
                 <Pressable
                   onPress={async () => {
                     await deleteSettlement(item.id);
-                    const updated = await listSettlements();
-                    setSettleItems(updated);
+                    refreshSettlements();
                   }}
                   hitSlop={8}
                 >
@@ -3489,112 +3617,36 @@ function ExpenseReportsScreen() {
           </View>
         </View>
 
-        {loading ? (
-          <View style={s.reportLoadingContainer}>
-            <Animated.View style={[s.reportLoadingIconWrap, { transform: [{ rotate: spin }, { scale: pulseAnim }] }]}>
-              <Text style={{ fontSize: 38 }}>📊</Text>
-            </Animated.View>
-            <Text style={s.reportLoadingTitle}>Summoning your financial insights... ✨</Text>
-            <Text style={s.reportLoadingSub}>Crunching numbers & baking your charts 🥧</Text>
-          </View>
-        ) : rows.length === 0 ? (
-          <View style={s.emptyStateContainer}>
-            <Image source={APP_ICONS.empty} style={s.emptyIcon} />
-            <Text style={s.emptyText}>No expenses recorded for this month yet 📈.</Text>
-          </View>
-        ) : (
-          <>
-            
-
-            <Text style={s.listLabel}>Spending Bars 📊</Text>
-            <View style={[s.reportCard, cardShadow]}>
-              {rows.map((row, index) => (
-                <Pressable key={row.category} style={s.barChartRow} onPress={() => setSelectedCategory(row.category)}>
-                  <Text style={s.barChartLabel} numberOfLines={1}>
-                    {row.category}
-                  </Text>
-                  <View style={s.barTrack}>
-                    <View
-                      style={[
-                        s.barFill,
-                        {
-                          width: `${(row.total / max) * 100}%`,
-                          backgroundColor: chartColorAt(index),
-                        },
-                      ]}
-                    />
-                  </View>
-                  <Text style={s.barAmount}>₹{row.total.toFixed(0)}</Text>
-                </Pressable>
-              ))}
-            </View>
-
-            <Text style={s.listLabel}>Share of Spending 🍩</Text>
-            <View style={[s.reportCard, cardShadow]}>
-              <DonutChart
-                rows={rows}
-                selectedCategory={selectedCategory}
-                onSelectCategory={setSelectedCategory}
-              />
-              {selectedCategory ? (
-                <View style={{ marginTop: 16, width: "100%" }}>
-                  <Text style={[s.entryTitle, { marginBottom: 4 }]}>
-                    {selectedCategory} — {monthName}
-                  </Text>
-                  <Text style={[s.dateSub, { marginBottom: 8 }]}>
-                    Total: ₹{rows.find((r) => r.category === selectedCategory)?.total?.toFixed(0) ?? "0"}
-                  </Text>
-                  {categoryHistory.length === 0 ? (
-                    <Text style={s.dateSub}>No spending recorded for this category this month.</Text>
-                  ) : (
-                    categoryHistory.map((entry) => (
-                      <View
-                        key={entry.id}
-                        style={{
-                          flexDirection: "row",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          paddingVertical: 8,
-                          borderTopWidth: 1,
-                          borderTopColor: colors.border,
-                          gap: 10,
-                        }}
-                      >
-                        <View style={{ flex: 1 }}>
-                          <Text style={s.entryTitle} numberOfLines={1}>{entry.title}</Text>
-                          <Text style={s.dateSub}>{shortDate(entry.date)}</Text>
-                        </View>
-                        <Text style={[s.barAmount, { width: "auto" }]}>₹{Number(entry.amount).toFixed(0)}</Text>
-                      </View>
-                    ))
-                  )}
-                </View>
-              ) : (
-                <Text style={[s.dateSub, { marginTop: 12, textAlign: "center" }]}>
-                  Tap a category to see every date and amount for {monthName}.
-                </Text>
-              )}
-            </View>
-          </>
-        )}
-
-        {/* GIVE / GET SECTION INLINE IN REPORTS */}
-        <Text style={s.listLabel}>Give & Get 💸</Text>
-        <View style={[s.summaryCard, cardShadow, { marginBottom: 8 }]}>
-          <View style={s.reportMetricsRow}>
-            <View style={s.reportMetricCol}>
-              <Text style={s.balanceLabel}>To give</Text>
-              <Text style={[s.reportMetricValue, { color: colors.negative }]}>₹{giveTotal.toFixed(0)}</Text>
-            </View>
-            <View style={[s.reportMetricCol, { alignItems: "flex-end" }]}>
-              <Text style={s.balanceLabel}>To get</Text>
-              <Text style={[s.reportMetricValue, { color: colors.positive }]}>₹{getTotal.toFixed(0)}</Text>
-            </View>
+        <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 18 }}>
+          <Text style={[s.listLabel, { marginTop: 0, marginBottom: 0 }]}>Give & Get</Text>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <Text style={s.balanceLabel}>In balance</Text>
+            <Switch
+              value={includeDebts}
+              onValueChange={async (next) => {
+                setIncludeDebts(next);
+                await AsyncStorage.setItem(STORAGE_KEYS.INCLUDE_DEBTS, next ? "on" : "off");
+              }}
+              trackColor={{ false: colors.border, true: colors.notes }}
+              thumbColor="#FFFFFF"
+            />
           </View>
         </View>
+        {includeDebts ? (
+          <View style={[s.summaryCard, cardShadow, { marginTop: 10, marginBottom: 4 }]}>
+            <Text style={s.balanceLabel}>Balance after all debts</Text>
+            <Text style={[s.reportMetricValue, { color: balanceAfterDebts >= 0 ? colors.positive : colors.negative, fontSize: 22 }]}>
+              ₹{balanceAfterDebts.toFixed(0)}
+            </Text>
+            <Text style={[s.dateSub, { marginTop: 4 }]}>
+              Now ₹{accountBalance.toFixed(0)} · give −₹{giveTotal.toFixed(0)} · get +₹{getTotal.toFixed(0)}
+            </Text>
+          </View>
+        ) : null}
 
-        {renderSettleGroup("Give 💸", giveItems, colors.negative)}
-        {renderSettleGroup("Get 💰", getItems, colors.positive)}
+        {renderSettleGroup("Give", giveItems, colors.negative)}
+        {renderSettleGroup("Get", getItems, colors.positive)}
+        {doneSettleItems.length > 0 ? renderSettleGroup("Done", doneSettleItems, colors.textFaint) : null}
 
         {settleFormOpen && (
           <View style={[s.summaryCard, cardShadow, { marginTop: 16 }]}>
@@ -3646,11 +3698,75 @@ function ExpenseReportsScreen() {
         )}
         {!settleFormOpen && (
           <Pressable
-            style={[s.saveBtn, { backgroundColor: colors.notes, marginTop: 16, marginBottom: 8 }]}
+            style={[s.saveBtn, { backgroundColor: colors.notes, marginTop: 12, marginBottom: 4 }]}
             onPress={() => setSettleFormOpen(true)}
           >
             <Text style={s.saveBtnText}>+ Add Give/Get Entry</Text>
           </Pressable>
+        )}
+
+        {loading ? (
+          <View style={s.reportLoadingContainer}>
+            <Animated.View style={[s.reportLoadingIconWrap, { transform: [{ rotate: spin }, { scale: pulseAnim }] }]}>
+              <Text style={{ fontSize: 38 }}>📊</Text>
+            </Animated.View>
+            <Text style={s.reportLoadingTitle}>Summoning your financial insights... ✨</Text>
+            <Text style={s.reportLoadingSub}>Crunching numbers & baking your charts 🥧</Text>
+          </View>
+        ) : rows.length === 0 ? (
+          <View style={s.emptyStateContainer}>
+            <Image source={APP_ICONS.empty} style={s.emptyIcon} />
+            <Text style={s.emptyText}>No expenses recorded for this month yet 📈.</Text>
+          </View>
+        ) : (
+          <>
+            <Text style={s.listLabel}>Share of Spending 🍩</Text>
+            <View style={[s.reportCard, cardShadow]}>
+              <DonutChart
+                rows={rows}
+                selectedCategory={selectedCategory}
+                onSelectCategory={setSelectedCategory}
+              />
+              {selectedCategory ? (
+                <View style={{ marginTop: 16, width: "100%" }}>
+                  <Text style={[s.entryTitle, { marginBottom: 4 }]}>
+                    {selectedCategory} — {monthName}
+                  </Text>
+                  <Text style={[s.dateSub, { marginBottom: 8 }]}>
+                    Total: ₹{rows.find((r) => r.category === selectedCategory)?.total?.toFixed(0) ?? "0"}
+                  </Text>
+                  {categoryHistory.length === 0 ? (
+                    <Text style={s.dateSub}>No spending recorded for this category this month.</Text>
+                  ) : (
+                    categoryHistory.map((entry) => (
+                      <View
+                        key={entry.id}
+                        style={{
+                          flexDirection: "row",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          paddingVertical: 8,
+                          borderTopWidth: 1,
+                          borderTopColor: colors.border,
+                          gap: 10,
+                        }}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text style={s.entryTitle} numberOfLines={1}>{entry.title}</Text>
+                          <Text style={s.dateSub}>{shortDate(entry.date)}</Text>
+                        </View>
+                        <Text style={[s.barAmount, { width: "auto" }]}>₹{Number(entry.amount).toFixed(0)}</Text>
+                      </View>
+                    ))
+                  )}
+                </View>
+              ) : (
+                <Text style={[s.dateSub, { marginTop: 12, textAlign: "center" }]}>
+                  Tap a category to see every date and amount for {monthName}.
+                </Text>
+              )}
+            </View>
+          </>
         )}
       </ScrollView>
     </View>
@@ -4212,6 +4328,7 @@ function ProfileModal({ visible, onClose, authData, onUpdateUser, onSignOut, the
                   const next = !notificationsEnabled;
                   setNotificationsFlag(next);
                   await setNotificationsEnabled(next);
+                  if (next) checkTaskReminders().catch(() => {});
                   if (next && Platform.OS === "web" && typeof Notification !== "undefined" && Notification.permission === "denied") {
                     Alert.alert("Notifications are blocked", "Allow notifications for this site in Safari settings, then turn this on again.");
                   }
@@ -5392,8 +5509,12 @@ export default function App() {
     if (Platform.OS === "web" && typeof document !== "undefined") {
       document.addEventListener("visibilitychange", onVisible);
     }
+    const appStateSub = AppState.addEventListener("change", (next) => {
+      if (next === "active") checkTaskReminders();
+    });
     return () => {
       clearInterval(timer);
+      appStateSub.remove();
       if (Platform.OS === "web" && typeof document !== "undefined") {
         document.removeEventListener("visibilitychange", onVisible);
       }
