@@ -206,11 +206,8 @@ function hslToHex(h, satPercent, lightPercent) {
 }
 
 const CHART_COLORS = [
-  "#F4B6C2", "#F6C9A8", "#F6E3A1", "#D5E7A3", "#B7E0C2", "#A9DDD4",
-  "#A9D4EA", "#B7C6F0", "#D0B8F0", "#E7C2EA", "#F3B7D4", "#F2C1B0",
-  "#E6D4A8", "#C9DDB4", "#A8D8C8", "#A8CDE4", "#C2B6E8", "#E8C4D8",
-  "#F0D0B4", "#DDE6B0", "#B8E0D4", "#C4D4F2", "#E0C8F0", "#F6D6C8",
-];
+"#D7264D", "#8ED6F5", "#087F5B", "#F28AB2", "#243B6B", "#FFE66D", "#753BBD", "#B9D98A", "#252525", "#FF9F43", "#A5A5F5", "#B94E16", "#DCC6F2", "#087E8B", "#FF7F6A",
+  ];
 
 function chartColorAt(index) {
   if (index < CHART_COLORS.length) return CHART_COLORS[index];
@@ -332,6 +329,7 @@ const STORAGE_KEYS = {
   NOTIFICATIONS: "@winnie_notifications",
   NOTIFIED_SLOTS: "@winnie_notified_slots",
   INCLUDE_DEBTS: "@winnie_include_debts",
+  GIVE_GET_MINIMIZED: "@winnie_give_get_minimized",
 };
 
 export async function getStoredAuth() {
@@ -1955,7 +1953,6 @@ const EMOJI_SUGGESTIONS = ["🏃", "📚", "🥗", "💧", "🧘", "🚶", "💊
 function RitualModal({ visible, editingRitual, onClose, onSaved, onDeleted }) {
   const [name, setName] = useState("");
   const [emoji, setEmoji] = useState("✨");
-  const [keyboardHeight, setKeyboardHeight] = useState(0);
   const isEditing = !!editingRitual;
 
   useEffect(() => {
@@ -1967,23 +1964,8 @@ function RitualModal({ visible, editingRitual, onClose, onSaved, onDeleted }) {
         setName("");
         setEmoji("✨");
       }
-    } else {
-      setKeyboardHeight(0);
     }
   }, [visible, editingRitual]);
-
-  useEffect(() => {
-    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
-    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
-    const showSub = Keyboard.addListener(showEvent, (event) => {
-      setKeyboardHeight(event.endCoordinates?.height || 0);
-    });
-    const hideSub = Keyboard.addListener(hideEvent, () => setKeyboardHeight(0));
-    return () => {
-      showSub.remove();
-      hideSub.remove();
-    };
-  }, []);
 
   async function handleSave() {
     if (!name.trim()) return;
@@ -2012,20 +1994,33 @@ function RitualModal({ visible, editingRitual, onClose, onSaved, onDeleted }) {
   }
 
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <View style={{ flex: 1, justifyContent: "flex-end", paddingBottom: keyboardHeight }}>
-        <Pressable style={{ flex: 1 }} onPress={onClose} />
-        <ScrollView
-          style={{ maxHeight: keyboardHeight ? "78%" : "88%", flexGrow: 0 }}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator
-          nestedScrollEnabled
-          contentContainerStyle={{ paddingBottom: 4 }}
-        >
-          <View style={[s.sheet, { paddingBottom: BOTTOM_INSET + 16 }]}>
-            <View style={s.grabber} />
-            <Text style={s.modalHeaderTitle}>{isEditing ? "Edit Ritual ✏️" : "New Daily Ritual ✨"}</Text>
+    <Modal visible={visible} animationType="fade" transparent onRequestClose={onClose}>
+      <KeyboardAvoidingView
+        style={s.popupOverlay}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+      >
+        <Pressable style={s.popupBackdropDismiss} onPress={onClose} />
+        <View style={[s.popupCard, cardShadow]}>
+          <View style={s.popupHeader}>
+            <Text style={s.popupHeaderTitle}>{isEditing ? "Edit Ritual ✏️" : "New Daily Ritual ✨"}</Text>
+            <TouchableOpacity
+              onPress={onClose}
+              style={s.popupCloseBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="Close"
+              accessibilityRole="button"
+            >
+              <Text style={s.popupCloseText}>✕</Text>
+            </TouchableOpacity>
+          </View>
 
+          <ScrollView
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+            nestedScrollEnabled
+            style={s.popupScroll}
+            contentContainerStyle={{ paddingBottom: 4 }}
+          >
             <Text style={s.label}>Ritual Name 📝</Text>
             <TextInput
               value={name}
@@ -2067,7 +2062,7 @@ function RitualModal({ visible, editingRitual, onClose, onSaved, onDeleted }) {
               ))}
             </View>
 
-            <Pressable onPress={handleSave} style={[s.saveBtn, { backgroundColor: colors.habitGreen }]}>
+            <Pressable onPress={handleSave} style={[s.saveBtn, { backgroundColor: colors.habitGreen, marginTop: 14 }]}>
               <Text style={s.saveBtnText}>{isEditing ? "Update Ritual 🚀" : "Add Ritual ➕"}</Text>
             </Pressable>
 
@@ -2076,9 +2071,9 @@ function RitualModal({ visible, editingRitual, onClose, onSaved, onDeleted }) {
                 <Text style={{ color: colors.negative, fontWeight: "600" }}>Delete this ritual 🗑️</Text>
               </Pressable>
             )}
-          </View>
-        </ScrollView>
-      </View>
+          </ScrollView>
+        </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
@@ -2737,22 +2732,37 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
   }
 
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+    <Modal visible={visible} animationType="fade" transparent onRequestClose={onClose}>
       <KeyboardAvoidingView
-        style={{ flex: 1, justifyContent: "flex-end" }}
+        style={s.popupOverlay}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 10 : 0}
       >
-        <Pressable style={{ flex: 1 }} onPress={onClose} />
-        <ScrollView
-          style={{ maxHeight: "88%", flexGrow: 0 }}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator
-          nestedScrollEnabled
-          contentContainerStyle={{ paddingBottom: 4 }}
-        >
-          <View style={[s.sheetCompact, { paddingBottom: BOTTOM_INSET + 20 }]}>
-            <View style={s.grabber} />
+        <Pressable style={s.popupBackdropDismiss} onPress={onClose} />
+        <View style={[s.popupCard, cardShadow]}>
+          <View style={s.popupHeader}>
+            <Text style={s.popupHeaderTitle}>
+              {isEditing
+                ? (entryType === "income" ? "Edit Income 💰" : "Edit Expense 💳")
+                : (entryType === "income" ? "Add Income 💰" : "Add Expense 💳")}
+            </Text>
+            <TouchableOpacity
+              onPress={onClose}
+              style={s.popupCloseBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="Close"
+              accessibilityRole="button"
+            >
+              <Text style={s.popupCloseText}>✕</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+            nestedScrollEnabled
+            style={s.popupScroll}
+            contentContainerStyle={{ paddingBottom: 4 }}
+          >
             {/* Income / Expense Segment Selector */}
             <View style={s.segment}>
               <Pressable
@@ -2824,8 +2834,8 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
             >
               <Text style={s.saveBtnText}>{isEditing ? "Update Entry 🔄" : "Save Entry 💾"}</Text>
             </Pressable>
-          </View>
-        </ScrollView>
+          </ScrollView>
+        </View>
       </KeyboardAvoidingView>
     </Modal>
   );
@@ -3380,6 +3390,7 @@ function ExpenseReportsScreen() {
   const [settleDirection, setSettleDirection] = useState("give");
   const [accountBalance, setAccountBalance] = useState(0);
   const [includeDebts, setIncludeDebts] = useState(false);
+  const [giveGetMinimized, setGiveGetMinimized] = useState(false);
 
   const spinAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -3474,7 +3485,16 @@ function ExpenseReportsScreen() {
     AsyncStorage.getItem(STORAGE_KEYS.INCLUDE_DEBTS)
       .then((value) => setIncludeDebts(value === "on"))
       .catch(() => {});
+    AsyncStorage.getItem(STORAGE_KEYS.GIVE_GET_MINIMIZED)
+      .then((value) => setGiveGetMinimized(value === "true"))
+      .catch(() => {});
   }, []);
+
+  async function toggleGiveGetMinimized() {
+    const next = !giveGetMinimized;
+    setGiveGetMinimized(next);
+    await AsyncStorage.setItem(STORAGE_KEYS.GIVE_GET_MINIMIZED, next ? "true" : "false");
+  }
 
   async function handleSettleAdd() {
     const amountNum = Number(settleAmount);
@@ -3618,7 +3638,24 @@ function ExpenseReportsScreen() {
         </View>
 
         <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 18 }}>
-          <Text style={[s.listLabel, { marginTop: 0, marginBottom: 0 }]}>Give & Get</Text>
+          <Pressable
+            onPress={toggleGiveGetMinimized}
+            style={{ flexDirection: "row", alignItems: "center", gap: 8, flex: 1, paddingVertical: 4 }}
+            accessibilityLabel={giveGetMinimized ? "Expand Give and Get section" : "Minimize Give and Get section"}
+            accessibilityRole="button"
+          >
+            <Text style={[s.listLabel, { marginTop: 0, marginBottom: 0 }]}>Give & Get 🤝</Text>
+            <View style={s.giveGetToggleBtn}>
+              <Text style={s.giveGetToggleText}>
+                {giveGetMinimized ? "Show ▼" : "Hide ▲"}
+              </Text>
+            </View>
+            {giveGetMinimized && (
+              <Text style={{ fontSize: 11, color: colors.textFaint, fontWeight: "600" }}>
+                ({giveItems.length} Give · {getItems.length} Get)
+              </Text>
+            )}
+          </Pressable>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
             <Text style={s.balanceLabel}>In balance</Text>
             <Switch
@@ -3632,77 +3669,82 @@ function ExpenseReportsScreen() {
             />
           </View>
         </View>
-        {includeDebts ? (
-          <View style={[s.summaryCard, cardShadow, { marginTop: 10, marginBottom: 4 }]}>
-            <Text style={s.balanceLabel}>Balance after all debts</Text>
-            <Text style={[s.reportMetricValue, { color: balanceAfterDebts >= 0 ? colors.positive : colors.negative, fontSize: 22 }]}>
-              ₹{balanceAfterDebts.toFixed(0)}
-            </Text>
-            <Text style={[s.dateSub, { marginTop: 4 }]}>
-              Now ₹{accountBalance.toFixed(0)} · give −₹{giveTotal.toFixed(0)} · get +₹{getTotal.toFixed(0)}
-            </Text>
-          </View>
-        ) : null}
 
-        {renderSettleGroup("Give", giveItems, colors.negative)}
-        {renderSettleGroup("Get", getItems, colors.positive)}
-        {doneSettleItems.length > 0 ? renderSettleGroup("Done", doneSettleItems, colors.textFaint) : null}
+        {!giveGetMinimized && (
+          <>
+            {includeDebts ? (
+              <View style={[s.summaryCard, cardShadow, { marginTop: 10, marginBottom: 4 }]}>
+                <Text style={s.balanceLabel}>Balance after all debts</Text>
+                <Text style={[s.reportMetricValue, { color: balanceAfterDebts >= 0 ? colors.positive : colors.negative, fontSize: 22 }]}>
+                  ₹{balanceAfterDebts.toFixed(0)}
+                </Text>
+                <Text style={[s.dateSub, { marginTop: 4 }]}>
+                  Now ₹{accountBalance.toFixed(0)} · give −₹{giveTotal.toFixed(0)} · get +₹{getTotal.toFixed(0)}
+                </Text>
+              </View>
+            ) : null}
 
-        {settleFormOpen && (
-          <View style={[s.summaryCard, cardShadow, { marginTop: 16 }]}>
-            <View style={s.segment}>
+            {renderSettleGroup("Give", giveItems, colors.negative)}
+            {renderSettleGroup("Get", getItems, colors.positive)}
+            {doneSettleItems.length > 0 ? renderSettleGroup("Done", doneSettleItems, colors.textFaint) : null}
+
+            {settleFormOpen && (
+              <View style={[s.summaryCard, cardShadow, { marginTop: 16 }]}>
+                <View style={s.segment}>
+                  <Pressable
+                    onPress={() => setSettleDirection("give")}
+                    style={[s.segmentBtn, settleDirection === "give" && { backgroundColor: colors.negative }]}
+                  >
+                    <Text style={[s.segmentText, settleDirection === "give" && s.segmentTextActive]}>Give</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => setSettleDirection("get")}
+                    style={[s.segmentBtn, settleDirection === "get" && { backgroundColor: colors.positive }]}
+                  >
+                    <Text style={[s.segmentText, settleDirection === "get" && s.segmentTextActive]}>Get</Text>
+                  </Pressable>
+                </View>
+                <Text style={s.label}>Person</Text>
+                <TextInput
+                  value={settlePerson}
+                  onChangeText={setSettlePerson}
+                  placeholder="Friend's name"
+                  placeholderTextColor={colors.textFaint}
+                  cursorColor={colors.text}
+                  style={[s.input, { color: colors.text }]}
+                />
+                <Text style={s.label}>Amount (₹)</Text>
+                <TextInput
+                  value={settleAmount}
+                  onChangeText={setSettleAmount}
+                  placeholder="0"
+                  placeholderTextColor={colors.textFaint}
+                  keyboardType="numeric"
+                  cursorColor={colors.text}
+                  style={[s.input, { color: colors.text }]}
+                />
+                <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+                  <Pressable
+                    onPress={() => setSettleFormOpen(false)}
+                    style={[s.saveBtn, { flex: 1, marginTop: 0, backgroundColor: colors.surfaceRaised, borderWidth: 1, borderColor: colors.border }]}
+                  >
+                    <Text style={{ color: colors.textMuted, fontWeight: "700" }}>Cancel</Text>
+                  </Pressable>
+                  <Pressable onPress={handleSettleAdd} style={[s.saveBtn, { flex: 2, marginTop: 0, backgroundColor: colors.notes }]}>
+                    <Text style={s.saveBtnText}>Save</Text>
+                  </Pressable>
+                </View>
+              </View>
+            )}
+            {!settleFormOpen && (
               <Pressable
-                onPress={() => setSettleDirection("give")}
-                style={[s.segmentBtn, settleDirection === "give" && { backgroundColor: colors.negative }]}
+                style={[s.saveBtn, { backgroundColor: colors.notes, marginTop: 12, marginBottom: 4 }]}
+                onPress={() => setSettleFormOpen(true)}
               >
-                <Text style={[s.segmentText, settleDirection === "give" && s.segmentTextActive]}>Give</Text>
+                <Text style={s.saveBtnText}>+ Add Give/Get Entry</Text>
               </Pressable>
-              <Pressable
-                onPress={() => setSettleDirection("get")}
-                style={[s.segmentBtn, settleDirection === "get" && { backgroundColor: colors.positive }]}
-              >
-                <Text style={[s.segmentText, settleDirection === "get" && s.segmentTextActive]}>Get</Text>
-              </Pressable>
-            </View>
-            <Text style={s.label}>Person</Text>
-            <TextInput
-              value={settlePerson}
-              onChangeText={setSettlePerson}
-              placeholder="Friend's name"
-              placeholderTextColor={colors.textFaint}
-              cursorColor={colors.text}
-              style={[s.input, { color: colors.text }]}
-            />
-            <Text style={s.label}>Amount (₹)</Text>
-            <TextInput
-              value={settleAmount}
-              onChangeText={setSettleAmount}
-              placeholder="0"
-              placeholderTextColor={colors.textFaint}
-              keyboardType="numeric"
-              cursorColor={colors.text}
-              style={[s.input, { color: colors.text }]}
-            />
-            <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
-              <Pressable
-                onPress={() => setSettleFormOpen(false)}
-                style={[s.saveBtn, { flex: 1, marginTop: 0, backgroundColor: colors.surfaceRaised, borderWidth: 1, borderColor: colors.border }]}
-              >
-                <Text style={{ color: colors.textMuted, fontWeight: "700" }}>Cancel</Text>
-              </Pressable>
-              <Pressable onPress={handleSettleAdd} style={[s.saveBtn, { flex: 2, marginTop: 0, backgroundColor: colors.notes }]}>
-                <Text style={s.saveBtnText}>Save</Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-        {!settleFormOpen && (
-          <Pressable
-            style={[s.saveBtn, { backgroundColor: colors.notes, marginTop: 12, marginBottom: 4 }]}
-            onPress={() => setSettleFormOpen(true)}
-          >
-            <Text style={s.saveBtnText}>+ Add Give/Get Entry</Text>
-          </Pressable>
+            )}
+          </>
         )}
 
         {loading ? (
@@ -6048,6 +6090,81 @@ function createAppStyles(colors) {
   learningEntryHint: { color: colors.textFaint, fontSize: 10, marginTop: 4 },
 
   modalBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.6)" },
+  popupOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 20,
+  },
+  popupBackdropDismiss: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  popupCard: {
+    width: "100%",
+    maxWidth: 400,
+    backgroundColor: colors.surfaceRaised,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 20,
+    paddingTop: 18,
+    paddingBottom: 20,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.35,
+    shadowRadius: 20,
+    elevation: 12,
+  },
+  popupHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingBottom: 12,
+    marginBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+  },
+  popupHeaderTitle: {
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: "800",
+  },
+  popupCloseBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: colors.surface,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  popupCloseText: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: colors.textMuted,
+  },
+  popupScroll: {
+    maxHeight: 460,
+    flexGrow: 0,
+  },
+  giveGetToggleBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 12,
+    backgroundColor: colors.surfaceRaised,
+    borderWidth: 1,
+    borderColor: colors.border,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  giveGetToggleText: {
+    fontSize: 11,
+    color: colors.textMuted,
+    fontWeight: "700",
+  },
   sheetWrap: { justifyContent: "flex-end", flex: 1 },
   sheet: {
     backgroundColor: colors.surfaceRaised,
