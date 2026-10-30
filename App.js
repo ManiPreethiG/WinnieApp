@@ -221,7 +221,7 @@ function isFutureDate(dateStr) {
 
 const TOP_INSET = Platform.OS === "android" ? StatusBar.currentHeight || 26 : 48;
 const BOTTOM_INSET = 28;
-const TAB_BAR_HEIGHT = 62;
+const TAB_BAR_HEIGHT = Platform.OS === "ios" ? 108 : 96;
 
 const cardShadow = {
   shadowColor: "#000",
@@ -392,7 +392,7 @@ export function setSheetsContext(token, sheetId) {
 
 const TABLE_COLUMNS = {
   profile: ["email", "name", "gender", "updated_at"],
-  expenses: ["id", "date", "type", "category_id", "title", "amount"],
+  expenses: ["id", "date", "type", "category_id", "title", "amount", "note"],
   expense_breakdown_items: ["id", "expense_id", "label", "amount", "sort_order"],
   tags: ["id", "kind", "name", "usage_count"],
   rituals: ["id", "name", "emoji", "sort_order"],
@@ -617,7 +617,8 @@ async function initDatabase() {
       type TEXT NOT NULL,
       category_id INTEGER,
       title TEXT NOT NULL,
-      amount REAL NOT NULL
+      amount REAL NOT NULL,
+      note TEXT NOT NULL DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS expense_breakdown_items (
@@ -707,6 +708,7 @@ async function initDatabase() {
   await db.runAsync(`ALTER TABLE buy_items ADD COLUMN price_max REAL DEFAULT 0`).catch(() => {});
   await db.runAsync(`ALTER TABLE buy_items ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`).catch(() => {});
   await db.runAsync(`ALTER TABLE tasks ADD COLUMN google_event_id TEXT DEFAULT NULL`).catch(() => {});
+  await db.runAsync(`ALTER TABLE expenses ADD COLUMN note TEXT DEFAULT ''`).catch(() => {});
 
   const countRow = await db.getFirstAsync(`SELECT COUNT(*) as count FROM rituals`);
   if (!countRow || countRow.count === 0) {
@@ -769,6 +771,13 @@ async function deleteRitual(id) {
   await db.runAsync(`DELETE FROM rituals WHERE id = ?`, [id]);
   triggerTableSync("rituals");
   triggerTableSync("ritual_logs");
+}
+async function reorderRituals(ordered) {
+  const db = await getDb();
+  for (let i = 0; i < ordered.length; i++) {
+    await db.runAsync(`UPDATE rituals SET sort_order = ? WHERE id = ?`, [i + 1, ordered[i].id]);
+  }
+  triggerTableSync("rituals");
 }
 async function toggleRitualLog(date, ritualId) {
   const db = await getDb();
@@ -980,12 +989,14 @@ async function addBuyItem(title, priceMin = 0, priceMax = 0) {
   triggerTableSync("buy_items");
   return res.lastInsertRowId;
 }
-async function swapBuyItemsOrder(itemA, itemB) {
+async function updateBuyItem(id, title, priceMin = 0, priceMax = 0) {
   const db = await getDb();
-  const orderA = itemA.sort_order ?? 0;
-  const orderB = itemB.sort_order ?? 0;
-  await db.runAsync(`UPDATE buy_items SET sort_order = ? WHERE id = ?`, [orderB, itemA.id]);
-  await db.runAsync(`UPDATE buy_items SET sort_order = ? WHERE id = ?`, [orderA, itemB.id]);
+  await db.runAsync(`UPDATE buy_items SET title = ?, price_min = ?, price_max = ? WHERE id = ?`, [
+    title.trim(),
+    Number(priceMin) || 0,
+    Number(priceMax) || 0,
+    id,
+  ]);
   triggerTableSync("buy_items");
 }
 async function reorderBuyItems(orderedPending) {
@@ -1375,7 +1386,7 @@ async function deleteNote(id) {
 async function getEntriesForDate(date) {
   const db = await getDb();
   return db.getAllAsync(
-    `SELECT e.id, e.date, e.type, e.category_id, t.name as category_name, e.title, e.amount,
+    `SELECT e.id, e.date, e.type, e.category_id, t.name as category_name, e.title, e.amount, e.note,
             (SELECT COUNT(*) FROM expense_breakdown_items b WHERE b.expense_id = e.id) as breakdown_count
      FROM expenses e LEFT JOIN tags t ON t.id = e.category_id
      WHERE e.date = ? ORDER BY e.id DESC`,
@@ -1433,7 +1444,7 @@ async function getCategorySpendHistory(category, monthPrefix) {
   const db = await getDb();
   if (monthPrefix) {
     return db.getAllAsync(
-      `SELECT e.id, e.date, e.title, e.amount
+      `SELECT e.id, e.date, e.title, e.amount, e.note
        FROM expenses e LEFT JOIN tags t ON t.id = e.category_id
        WHERE e.type = 'expense' AND COALESCE(t.name, 'Uncategorised') = ? AND e.date LIKE ?
        ORDER BY e.date DESC, e.id DESC`,
@@ -1441,7 +1452,7 @@ async function getCategorySpendHistory(category, monthPrefix) {
     );
   }
   return db.getAllAsync(
-    `SELECT e.id, e.date, e.title, e.amount
+    `SELECT e.id, e.date, e.title, e.amount, e.note
      FROM expenses e LEFT JOIN tags t ON t.id = e.category_id
      WHERE e.type = 'expense' AND COALESCE(t.name, 'Uncategorised') = ?
      ORDER BY e.date DESC, e.id DESC`,
@@ -1451,8 +1462,8 @@ async function getCategorySpendHistory(category, monthPrefix) {
 async function addExpense(entry) {
   const db = await getDb();
   const result = await db.runAsync(
-    `INSERT INTO expenses (date, type, category_id, title, amount) VALUES (?, ?, ?, ?, ?)`,
-    [entry.date, entry.type, entry.categoryId, entry.title, entry.amount]
+    `INSERT INTO expenses (date, type, category_id, title, amount, note) VALUES (?, ?, ?, ?, ?, ?)`,
+    [entry.date, entry.type, entry.categoryId, entry.title, entry.amount, entry.note || ""]
   );
   const expenseId = result.lastInsertRowId;
   if (entry.breakdown && entry.breakdown.length > 0) {
@@ -1471,12 +1482,13 @@ async function addExpense(entry) {
 }
 async function updateExpense(id, entry) {
   const db = await getDb();
-  await db.runAsync(`UPDATE expenses SET date=?, type=?, category_id=?, title=?, amount=? WHERE id=?`, [
+  await db.runAsync(`UPDATE expenses SET date=?, type=?, category_id=?, title=?, amount=?, note=? WHERE id=?`, [
     entry.date,
     entry.type,
     entry.categoryId,
     entry.title,
     entry.amount,
+    entry.note || "",
     id,
   ]);
   await db.runAsync(`DELETE FROM expense_breakdown_items WHERE expense_id=?`, [id]);
@@ -1909,40 +1921,254 @@ function WeekStreakBar({ selectedDate, setSelectedDate, weekDays, logsMap, total
 }
 
 // ───────────── DYNAMIC RITUAL CIRCLE (HOME) ─────────────
-function DynamicRitualCircle({ ritual, completed, onPress, onLongPress }) {
-  const scaleAnim = useRef(new Animated.Value(1)).current;
+const RITUAL_ROW_H = 100;
+const RITUAL_MIN_COL = 78;
 
-  function handlePressIn() {
-    Animated.spring(scaleAnim, { toValue: 0.93, useNativeDriver: true, speed: 20 }).start();
+function ritualSlot(index, cols, colW) {
+  const safeCols = Math.max(1, cols);
+  return {
+    x: (index % safeCols) * colW,
+    y: Math.floor(index / safeCols) * RITUAL_ROW_H,
+  };
+}
+
+function shiftedIndex(index, from, to) {
+  if (from == null || to == null || from === to || index === from) {
+    return index === from ? to : index;
   }
-  function handlePressOut() {
-    Animated.spring(scaleAnim, { toValue: 1, useNativeDriver: true, bounciness: 8 }).start();
+  if (from < to && index > from && index <= to) return index - 1;
+  if (from > to && index < from && index >= to) return index + 1;
+  return index;
+}
+
+function DraggableRitualGrid({ rituals, completedSet, onToggle, onEdit, onReorder, onAdd }) {
+  const [width, setWidth] = useState(0);
+  const [draggingId, setDraggingId] = useState(null);
+  const positions = useRef({});
+  const responders = useRef({});
+  const ritualsRef = useRef(rituals);
+  const dragRef = useRef({ active: false, id: null });
+  const cbRef = useRef({});
+  ritualsRef.current = rituals;
+  const columns = width > 0 ? Math.max(1, Math.floor(width / RITUAL_MIN_COL)) : 1;
+  const colW = width > 0 ? width / columns : RITUAL_MIN_COL;
+  const metrics = useRef({ cols: columns, colW });
+  metrics.current = { cols: columns, colW };
+  cbRef.current = { onToggle, onEdit, onReorder };
+
+  function ensurePos(id, index) {
+    if (!positions.current[id]) {
+      const origin = ritualSlot(index, metrics.current.cols, metrics.current.colW);
+      positions.current[id] = {
+        x: new Animated.Value(origin.x),
+        y: new Animated.Value(origin.y),
+        scale: new Animated.Value(1),
+      };
+    }
+    return positions.current[id];
   }
+
+  useEffect(() => {
+    if (dragRef.current.active || width <= 0) return;
+    rituals.forEach((ritual, index) => {
+      const origin = ritualSlot(index, columns, colW);
+      const pos = ensurePos(ritual.id, index);
+      pos.x.setValue(origin.x);
+      pos.y.setValue(origin.y);
+      pos.scale.setValue(1);
+    });
+  }, [rituals, columns, colW, width]);
+
+  function springToSlot(pos, index) {
+    const origin = ritualSlot(index, metrics.current.cols, metrics.current.colW);
+    Animated.spring(pos.x, { toValue: origin.x, useNativeDriver: true, speed: 24, bounciness: 5 }).start();
+    Animated.spring(pos.y, { toValue: origin.y, useNativeDriver: true, speed: 24, bounciness: 5 }).start();
+  }
+
+  function settleOthers(from, hover, skipId) {
+    ritualsRef.current.forEach((ritual, index) => {
+      if (ritual.id === skipId) return;
+      const pos = positions.current[ritual.id];
+      if (!pos) return;
+      springToSlot(pos, shiftedIndex(index, from, hover));
+    });
+  }
+
+  function finishRitualDrag(id, cancelled = false) {
+    const drag = dragRef.current;
+    if (!drag || drag.finished || drag.id !== id) return;
+    drag.finished = true;
+    clearTimeout(drag.timer);
+    const list = ritualsRef.current;
+    const pos = positions.current[id];
+    const wasActive = drag.active;
+    drag.active = false;
+    setDraggingId(null);
+
+    if (!wasActive) {
+      if (pos) Animated.spring(pos.scale, { toValue: 1, useNativeDriver: true, speed: 24, bounciness: 6 }).start();
+      const tapped = list.find((ritual) => ritual.id === id);
+      if (!cancelled && !drag.moved && tapped) cbRef.current.onToggle?.(tapped);
+      return;
+    }
+
+    const ritual = list.find((item) => item.id === id);
+    if (pos) Animated.spring(pos.scale, { toValue: 1, useNativeDriver: true, speed: 24, bounciness: 4 }).start();
+
+    if (!cancelled && drag.moved && drag.hover !== drag.index) {
+      const next = list.slice();
+      const [moved] = next.splice(drag.index, 1);
+      next.splice(drag.hover, 0, moved);
+      next.forEach((item, index) => {
+        const itemPos = positions.current[item.id];
+        if (!itemPos) return;
+        const origin = ritualSlot(index, metrics.current.cols, metrics.current.colW);
+        itemPos.x.setValue(origin.x);
+        itemPos.y.setValue(origin.y);
+      });
+      cbRef.current.onReorder?.(next);
+      return;
+    }
+
+    list.forEach((item, index) => {
+      const itemPos = positions.current[item.id];
+      if (itemPos) springToSlot(itemPos, index);
+    });
+    if (!cancelled && drag.longFired && !drag.moved && ritual) cbRef.current.onEdit?.(ritual);
+  }
+
+  function responderFor(id) {
+    if (responders.current[id]) return responders.current[id];
+    const responder = PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderTerminationRequest: () => !dragRef.current.active,
+      onShouldBlockNativeResponder: () => true,
+      onPanResponderGrant: () => {
+        const index = ritualsRef.current.findIndex((ritual) => ritual.id === id);
+        if (index < 0) return;
+        const pos = ensurePos(id, index);
+        dragRef.current = {
+          active: false,
+          moved: false,
+          longFired: false,
+          finished: false,
+          id,
+          index,
+          hover: index,
+        };
+        Animated.spring(pos.scale, { toValue: 0.94, useNativeDriver: true, speed: 40, bounciness: 0 }).start();
+        dragRef.current.timer = setTimeout(() => {
+          if (dragRef.current.id !== id || dragRef.current.finished) return;
+          dragRef.current.longFired = true;
+          dragRef.current.active = true;
+          setDraggingId(id);
+          Animated.spring(pos.scale, { toValue: 1.14, useNativeDriver: true, speed: 18, bounciness: 7 }).start();
+        }, 380);
+      },
+      onPanResponderMove: (_, gesture) => {
+        const drag = dragRef.current;
+        if (drag.id !== id || drag.finished) return;
+        const distance = Math.hypot(gesture.dx, gesture.dy);
+        if (!drag.longFired) {
+          if (distance > 12) {
+            clearTimeout(drag.timer);
+            drag.moved = true;
+          }
+          return;
+        }
+        if (distance > 6) drag.moved = true;
+        const pos = positions.current[id];
+        if (!pos) return;
+        const origin = ritualSlot(drag.index, metrics.current.cols, metrics.current.colW);
+        const nextX = origin.x + gesture.dx;
+        const nextY = origin.y + gesture.dy;
+        pos.x.setValue(nextX);
+        pos.y.setValue(nextY);
+        const { cols, colW: cellW } = metrics.current;
+        const col = Math.max(0, Math.min(cols - 1, Math.floor((nextX + cellW / 2) / cellW)));
+        const row = Math.max(0, Math.floor((nextY + RITUAL_ROW_H / 2) / RITUAL_ROW_H));
+        const maxIndex = Math.max(0, ritualsRef.current.length - 1);
+        const hover = Math.max(0, Math.min(maxIndex, row * cols + col));
+        if (hover !== drag.hover) {
+          drag.hover = hover;
+          settleOthers(drag.index, hover, id);
+        }
+      },
+      onPanResponderRelease: () => finishRitualDrag(id),
+      onPanResponderTerminate: () => finishRitualDrag(id, true),
+    });
+    responders.current[id] = responder;
+    return responder;
+  }
+
+  const slotCount = rituals.length + 1;
+  const rows = Math.max(1, Math.ceil(slotCount / columns));
+  const addOrigin = ritualSlot(rituals.length, columns, colW);
 
   return (
-    <View style={s.habitCircleWrap}>
-      <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
-        <Pressable
-          onPress={onPress}
-          onLongPress={onLongPress}
-          onPressIn={handlePressIn}
-          onPressOut={handlePressOut}
-          style={[
-            s.habitCircleBtn,
-            completed ? s.habitCircleBtnActive : s.habitCircleBtnInactive,
-          ]}
+    <View
+      onLayout={(event) => setWidth(event.nativeEvent.layout.width)}
+      style={{ height: width > 0 ? rows * RITUAL_ROW_H : RITUAL_ROW_H, marginTop: 8 }}
+    >
+      {width > 0 &&
+        rituals.map((ritual, index) => {
+          const pos = ensurePos(ritual.id, index);
+          const completed = completedSet.has(ritual.id);
+          const dragging = draggingId === ritual.id;
+          return (
+            <Animated.View
+              key={ritual.id}
+              {...responderFor(ritual.id).panHandlers}
+              style={{
+                position: "absolute",
+                width: colW,
+                height: RITUAL_ROW_H,
+                alignItems: "center",
+                justifyContent: "flex-start",
+                paddingTop: 4,
+                zIndex: dragging ? 30 : 1,
+                elevation: dragging ? 12 : 0,
+                transform: [{ translateX: pos.x }, { translateY: pos.y }, { scale: pos.scale }],
+              }}
+            >
+              <View
+                style={[
+                  s.habitCircleBtn,
+                  completed ? s.habitCircleBtnActive : s.habitCircleBtnInactive,
+                  dragging && { borderColor: colors.streakOrange, shadowOpacity: 0.35, shadowRadius: 10, shadowOffset: { width: 0, height: 6 }, shadowColor: "#000" },
+                ]}
+              >
+                <Text style={s.habitEmoji}>{ritual.emoji}</Text>
+                {completed && (
+                  <View style={s.habitCheckmarkBadge}>
+                    <Text style={s.habitCheckmarkText}>✓</Text>
+                  </View>
+                )}
+              </View>
+              <Text style={[s.habitLabel, completed && { color: colors.text, fontWeight: "700" }]} numberOfLines={1}>
+                {ritual.name}
+              </Text>
+            </Animated.View>
+          );
+        })}
+      {width > 0 && (
+        <View
+          style={{
+            position: "absolute",
+            width: colW,
+            height: RITUAL_ROW_H,
+            alignItems: "center",
+            paddingTop: 4,
+            transform: [{ translateX: addOrigin.x }, { translateY: addOrigin.y }],
+          }}
         >
-          <Text style={s.habitEmoji}>{ritual.emoji}</Text>
-          {completed && (
-            <View style={s.habitCheckmarkBadge}>
-              <Text style={s.habitCheckmarkText}>✓</Text>
-            </View>
-          )}
-        </Pressable>
-      </Animated.View>
-      <Text style={[s.habitLabel, completed && { color: colors.text, fontWeight: "700" }]} numberOfLines={1}>
-        {ritual.name}
-      </Text>
+          <Pressable onPress={onAdd} style={[s.habitCircleBtn, s.addCircleBtn]}>
+            <Text style={{ fontSize: 24, color: colors.textMuted }}>+</Text>
+          </Pressable>
+          <Text style={s.habitLabel}>Add ➕</Text>
+        </View>
+      )}
     </View>
   );
 }
@@ -2133,6 +2359,11 @@ function HomeScreen({ onRitualTapped }) {
     setModalVisible(true);
   }
 
+  async function handleReorderRituals(next) {
+    setRituals(next);
+    await reorderRituals(next);
+  }
+
   const selectedCompletedSet = logsMap[selectedDate] || new Set();
   const formattedSelected = relativeDayLabel(selectedDate);
 
@@ -2174,30 +2405,21 @@ function HomeScreen({ onRitualTapped }) {
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <View>
               <Text style={s.sectionHeaderTitle}>Daily Rituals ({formattedSelected}) 🎯</Text>
-              <Text style={s.sectionHeaderSub}>Tap to complete · Long-press to edit or delete 💡</Text>
+              <Text style={s.sectionHeaderSub}>Tap to log · Hold and drag to move · Hold to edit</Text>
             </View>
             <Pressable onPress={handleAddRitual} style={s.addRitualTopBtn}>
               <Text style={s.addRitualTopBtnText}>+ Add ➕</Text>
             </Pressable>
           </View>
 
-          <View style={s.habitsRow}>
-            {rituals.map((r) => (
-              <DynamicRitualCircle
-                key={r.id}
-                ritual={r}
-                completed={selectedCompletedSet.has(r.id)}
-                onPress={() => handleToggle(r)}
-                onLongPress={() => handleEditRitual(r)}
-              />
-            ))}
-            <View style={s.habitCircleWrap}>
-              <Pressable onPress={handleAddRitual} style={[s.habitCircleBtn, s.addCircleBtn]}>
-                <Text style={{ fontSize: 24, color: colors.textMuted }}>+</Text>
-              </Pressable>
-              <Text style={s.habitLabel}>Add ➕</Text>
-            </View>
-          </View>
+          <DraggableRitualGrid
+            rituals={rituals}
+            completedSet={selectedCompletedSet}
+            onToggle={handleToggle}
+            onEdit={handleEditRitual}
+            onReorder={handleReorderRituals}
+            onAdd={handleAddRitual}
+          />
         </View>
 
         {/* 3. TODAY'S ACTIVITY SUMMARY */}
@@ -2670,11 +2892,56 @@ function HealthScreen() {
 }
 
 // ───────────── ADD / EDIT EXPENSE MODAL ─────────────
+function isRouteCategory(name) {
+  return /transport|travel|commute|cab|uber|ola|metro|fuel/.test((name || "").toLowerCase());
+}
+
+function explanationCopy(name) {
+  const n = (name || "").toLowerCase();
+  if (/food|dining|breakfast|lunch|dinner|snack|coffee|eat/.test(n)) {
+    return { label: "What did you eat?", placeholder: "e.g. idly, dosa, filter coffee" };
+  }
+  if (n.includes("grocer")) {
+    return { label: "What groceries?", placeholder: "e.g. milk, rice, vegetables" };
+  }
+  if (n.includes("shop")) {
+    return { label: "What did you buy?", placeholder: "e.g. shirt, earphones" };
+  }
+  if (/health|medical|medicine|pharma|doctor/.test(n)) {
+    return { label: "What was this for?", placeholder: "e.g. clinic visit, medicines" };
+  }
+  if (n.includes("bill")) {
+    return { label: "Which bill?", placeholder: "e.g. electricity, wifi, rent" };
+  }
+  if (/entertain|movie|game|outing/.test(n)) {
+    return { label: "What was it?", placeholder: "e.g. movie tickets, turf with friends" };
+  }
+  return { label: "Note", placeholder: "What was this for? You'll see this in Reports" };
+}
+
+function splitRoute(note) {
+  const raw = (note || "").trim();
+  if (!raw || !/→|->/.test(raw)) return { from: "", to: "" };
+  const parts = raw.split(/\s*(?:→|->)\s*/);
+  if (parts.length < 2) return { from: "", to: "" };
+  return { from: parts[0], to: parts.slice(1).join(" → ") };
+}
+
+function joinRoute(from, to) {
+  const start = (from || "").trim();
+  const end = (to || "").trim();
+  if (start && end) return `${start} → ${end}`;
+  return start || end;
+}
+
 function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
   const [entryType, setEntryType] = useState("expense");
   const [title, setTitle] = useState("");
   const [category, setCategory] = useState(null);
   const [amount, setAmount] = useState("");
+  const [note, setNote] = useState("");
+  const [fromPlace, setFromPlace] = useState("");
+  const [toPlace, setToPlace] = useState("");
   const [showBreakdown, setShowBreakdown] = useState(false);
   const [breakdown, setBreakdown] = useState([]);
   const [saving, setSaving] = useState(false);
@@ -2688,6 +2955,10 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
       setTitle(editingEntry.title);
       setCategory(editingEntry.category);
       setAmount(String(editingEntry.amount));
+      setNote(editingEntry.note || "");
+      const route = splitRoute(editingEntry.note || "");
+      setFromPlace(route.from);
+      setToPlace(route.to);
       setBreakdown(editingEntry.breakdown || []);
       setShowBreakdown((editingEntry.breakdown || []).length > 0);
     } else {
@@ -2695,10 +2966,28 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
       setTitle("");
       setCategory(null);
       setAmount("");
+      setNote("");
+      setFromPlace("");
+      setToPlace("");
       setShowBreakdown(false);
       setBreakdown([]);
     }
   }, [visible, editingEntry]);
+
+  function handleCategory(tag) {
+    const leavingRoute = isRouteCategory(category?.name) && !isRouteCategory(tag.name);
+    if (leavingRoute) {
+      const joined = joinRoute(fromPlace, toPlace);
+      if (joined) setNote(joined);
+    }
+    if (isRouteCategory(tag.name)) {
+      const route = splitRoute(note);
+      setFromPlace(route.from || fromPlace);
+      setToPlace(route.to || toPlace);
+    }
+    setCategory(tag);
+    setTitle(tag.name);
+  }
 
   function handleBreakdownChange(items) {
     setBreakdown(items);
@@ -2711,12 +3000,19 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
     if (!title.trim() || !amountNum) return;
     setSaving(true);
     try {
+      const routeMode = entryType === "expense" && isRouteCategory(category?.name);
+      const noteToSave = entryType !== "expense"
+        ? ""
+        : routeMode
+          ? (joinRoute(fromPlace, toPlace) || note.trim())
+          : note.trim();
       const payload = {
         date,
         type: entryType,
         categoryId: category?.id ?? null,
         title: title.trim(),
         amount: amountNum,
+        note: noteToSave,
         breakdown: breakdown.length > 0 ? breakdown : undefined,
       };
       if (isEditing) {
@@ -2785,10 +3081,7 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
               <TagDropdown
                 kind={entryType}
                 value={category}
-                onChange={(tag) => {
-                  setCategory(tag);
-                  setTitle(tag.name);
-                }}
+                onChange={handleCategory}
                 accentColor={accent}
                 placeholder="Search or add category"
                 containerStyle={s.quickTitleInput}
@@ -2812,6 +3105,49 @@ function AddExpenseModal({ visible, date, editingEntry, onClose, onSaved }) {
             </View>
 
             {breakdown.length > 0 && <Text style={s.hint}>Auto-filled from breakdown below 🧮</Text>}
+
+            {entryType === "expense" && category && (
+              isRouteCategory(category.name) ? (
+                <View>
+                  <Text style={s.label}>Where did you go?</Text>
+                  <Text style={s.dateSub}>From and to show in Reports when you open {category.name}.</Text>
+                  <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                    <TextInput
+                      value={fromPlace}
+                      onChangeText={setFromPlace}
+                      placeholder="From"
+                      placeholderTextColor={colors.textFaint}
+                      cursorColor={colors.text}
+                      selectionColor={accent}
+                      style={[s.input, { flex: 1, color: colors.text }]}
+                    />
+                    <TextInput
+                      value={toPlace}
+                      onChangeText={setToPlace}
+                      placeholder="To"
+                      placeholderTextColor={colors.textFaint}
+                      cursorColor={colors.text}
+                      selectionColor={accent}
+                      style={[s.input, { flex: 1, color: colors.text }]}
+                    />
+                  </View>
+                </View>
+              ) : (
+                <View>
+                  <Text style={s.label}>{explanationCopy(category.name).label}</Text>
+                  <Text style={s.dateSub}>This note shows in Reports when you open {category.name}.</Text>
+                  <TextInput
+                    value={note}
+                    onChangeText={setNote}
+                    placeholder={explanationCopy(category.name).placeholder}
+                    placeholderTextColor={colors.textFaint}
+                    cursorColor={colors.text}
+                    selectionColor={accent}
+                    style={[s.input, { color: colors.text, marginTop: 8 }]}
+                  />
+                </View>
+              )
+            )}
 
             {/* BREAKDOWN SECTION */}
             <Pressable onPress={() => setShowBreakdown((v) => !v)} style={{ marginTop: 10, marginBottom: 4 }}>
@@ -2942,6 +3278,7 @@ function EntryCard({ entry, onDeleted, onEdit, interactive = true, showDate = fa
         ? { id: entry.category_id, name: entry.category_name, kind: entry.type, usage_count: 0 }
         : null,
       amount: entry.amount,
+      note: entry.note || "",
       breakdown: items,
     });
   }
@@ -2976,6 +3313,11 @@ function EntryCard({ entry, onDeleted, onEdit, interactive = true, showDate = fa
             <Text style={s.entryCategory} numberOfLines={1}>
               {[entry.category_name, showDate ? relativeDayLabel(entry.date) : null].filter(Boolean).join(" · ")}
             </Text>
+            {!!entry.note && (
+              <Text style={[s.entryCategory, { color: colors.text, marginTop: 2 }]} numberOfLines={2}>
+                {entry.note}
+              </Text>
+            )}
           </View>
         </View>
         <View style={s.entryRight}>
@@ -3785,26 +4127,27 @@ function ExpenseReportsScreen() {
                         key={entry.id}
                         style={{
                           flexDirection: "row",
-                          alignItems: "center",
+                          alignItems: "flex-start",
                           justifyContent: "space-between",
-                          paddingVertical: 8,
+                          paddingVertical: 10,
                           borderTopWidth: 1,
                           borderTopColor: colors.border,
                           gap: 10,
                         }}
                       >
+                        <Text style={[s.dateSub, { width: 78, marginTop: 2 }]}>{shortDate(entry.date)}</Text>
                         <View style={{ flex: 1 }}>
-                          <Text style={s.entryTitle} numberOfLines={1}>{entry.title}</Text>
-                          <Text style={s.dateSub}>{shortDate(entry.date)}</Text>
+                          <Text style={s.entryTitle}>{entry.note || entry.title}</Text>
+                          {!!entry.note && <Text style={s.dateSub}>{entry.title}</Text>}
                         </View>
-                        <Text style={[s.barAmount, { width: "auto" }]}>₹{Number(entry.amount).toFixed(0)}</Text>
+                        <Text style={[s.barAmount, { width: "auto", marginTop: 2 }]}>₹{Number(entry.amount).toFixed(0)}</Text>
                       </View>
                     ))
                   )}
                 </View>
               ) : (
                 <Text style={[s.dateSub, { marginTop: 12, textAlign: "center" }]}>
-                  Tap a category to see every date and amount for {monthName}.
+                  Tap a category to see each expense and the note you wrote.
                 </Text>
               )}
             </View>
@@ -3816,34 +4159,364 @@ function ExpenseReportsScreen() {
 }
 
 // ───────────── BUY SCREEN ─────────────
+const BUY_ROW_H = 96;
+
+function buyPriceLabel(item) {
+  if (item.price_min > 0 && item.price_max > 0) return `₹${item.price_min} – ₹${item.price_max}`;
+  if (item.price_max > 0) return `Up to ₹${item.price_max}`;
+  if (item.price_min > 0) return `From ₹${item.price_min}`;
+  return "";
+}
+
+function BuyItemModal({ visible, item, onClose, onSaved }) {
+  const [title, setTitle] = useState("");
+  const [priceMin, setPriceMin] = useState("");
+  const [priceMax, setPriceMax] = useState("");
+  const isEditing = !!item;
+
+  useEffect(() => {
+    if (!visible) return;
+    if (item) {
+      setTitle(item.title || "");
+      setPriceMin(item.price_min ? String(item.price_min) : "");
+      setPriceMax(item.price_max ? String(item.price_max) : "");
+    } else {
+      setTitle("");
+      setPriceMin("");
+      setPriceMax("");
+    }
+  }, [visible, item]);
+
+  async function handleSave() {
+    if (!title.trim()) return;
+    const min = parseFloat(priceMin) || 0;
+    const max = parseFloat(priceMax) || 0;
+    if (isEditing) await updateBuyItem(item.id, title.trim(), min, max);
+    else await addBuyItem(title.trim(), min, max);
+    onSaved();
+    onClose();
+  }
+
+  return (
+    <Modal visible={visible} animationType="fade" transparent onRequestClose={onClose}>
+      <KeyboardAvoidingView
+        style={s.popupOverlay}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+      >
+        <Pressable style={s.popupBackdropDismiss} onPress={onClose} />
+        <View style={[s.popupCard, cardShadow]}>
+          <View style={s.popupHeader}>
+            <Text style={s.popupHeaderTitle}>{isEditing ? "Edit Item ✏️" : "Add to Buy List 🛒"}</Text>
+            <TouchableOpacity
+              onPress={onClose}
+              style={s.popupCloseBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="Close"
+              accessibilityRole="button"
+            >
+              <Text style={s.popupCloseText}>✕</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+            nestedScrollEnabled
+            style={s.popupScroll}
+            contentContainerStyle={{ paddingBottom: 4 }}
+          >
+            <Text style={s.label}>Item name</Text>
+            <TextInput
+              value={title}
+              onChangeText={setTitle}
+              placeholder="e.g. AirPods, Running Shoes..."
+              placeholderTextColor={colors.textFaint}
+              cursorColor={colors.text}
+              selectionColor="#4ADE80"
+              style={[s.input, { color: colors.text }]}
+              autoFocus
+            />
+            <Text style={s.label}>Price range (₹)</Text>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <TextInput
+                value={priceMin}
+                onChangeText={setPriceMin}
+                placeholder="Min ₹"
+                placeholderTextColor={colors.textFaint}
+                keyboardType="numeric"
+                cursorColor={colors.text}
+                style={[s.input, { flex: 1, color: colors.text }]}
+              />
+              <TextInput
+                value={priceMax}
+                onChangeText={setPriceMax}
+                placeholder="Max ₹"
+                placeholderTextColor={colors.textFaint}
+                keyboardType="numeric"
+                cursorColor={colors.text}
+                style={[s.input, { flex: 1, color: colors.text }]}
+              />
+            </View>
+            <Pressable onPress={handleSave} style={[s.saveBtn, { backgroundColor: "#4ADE80", marginTop: 14 }]}>
+              <Text style={s.saveBtnText}>{isEditing ? "Update Item 🔄" : "Add to List ✅"}</Text>
+            </Pressable>
+          </ScrollView>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+function buyCardChrome(status, dragging) {
+  const borderColor = dragging
+    ? colors.streakOrange
+    : status === "green"
+      ? "#22C55E50"
+      : status === "red"
+        ? "#EF444450"
+        : status === "yellow"
+          ? "#FBBF2450"
+          : colors.border;
+  const textColor = status === "green" ? "#22C55E" : status === "red" ? "#EF4444" : status === "yellow" ? "#FBBF24" : colors.text;
+  return { borderColor, textColor };
+}
+
+function BuyDoneCard({ item, onToggle, onDelete, onEdit }) {
+  const price = buyPriceLabel(item);
+  return (
+    <SwipeableRow onSwipeDelete={() => onDelete(item.id)}>
+      <View
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          backgroundColor: colors.surface,
+          borderRadius: 14,
+          paddingVertical: 10,
+          paddingHorizontal: 12,
+          borderWidth: 1.5,
+          borderColor: colors.border,
+          gap: 8,
+        }}
+      >
+        <Pressable onLongPress={() => onEdit(item)} delayLongPress={320} style={{ flex: 1 }}>
+          <Text
+            style={{
+              color: colors.textFaint,
+              fontSize: 14,
+              fontWeight: "700",
+              textDecorationLine: "line-through",
+            }}
+          >
+            {item.title}
+          </Text>
+          {!!price && (
+            <Text style={{ color: colors.textFaint, fontSize: 11, marginTop: 2, fontWeight: "600" }}>{price}</Text>
+          )}
+        </Pressable>
+        <Pressable onPress={() => onToggle(item.id)} style={[s.buyCheckbox, s.buyCheckboxCompleted]}>
+          <Text style={s.buyCheckmark}>✓</Text>
+        </Pressable>
+        <Pressable onPress={() => onDelete(item.id)} hitSlop={10}>
+          <Text style={s.entryDeleteX}>×</Text>
+        </Pressable>
+      </View>
+    </SwipeableRow>
+  );
+}
+
+function BuyPriorityList({ items, affordFor, onToggle, onDelete, onEdit, onReorder }) {
+  const positions = useRef({});
+  const responders = useRef({});
+  const itemsRef = useRef(items);
+  const dragRef = useRef({ active: false, id: null });
+  const cbRef = useRef({});
+  const [draggingId, setDraggingId] = useState(null);
+  itemsRef.current = items;
+  cbRef.current = { onToggle, onDelete, onEdit, onReorder, affordFor };
+
+  function ensure(id, index) {
+    if (!positions.current[id]) {
+      positions.current[id] = {
+        y: new Animated.Value(index * BUY_ROW_H),
+        scale: new Animated.Value(1),
+      };
+    }
+    return positions.current[id];
+  }
+
+  useEffect(() => {
+    if (dragRef.current.active) return;
+    items.forEach((item, index) => {
+      const pos = ensure(item.id, index);
+      pos.y.setValue(index * BUY_ROW_H);
+      pos.scale.setValue(1);
+    });
+  }, [items]);
+
+  function springOthers(from, hover, skipId) {
+    itemsRef.current.forEach((item, index) => {
+      if (item.id === skipId) return;
+      const pos = positions.current[item.id];
+      if (!pos) return;
+      Animated.spring(pos.y, {
+        toValue: shiftedIndex(index, from, hover) * BUY_ROW_H,
+        useNativeDriver: true,
+        speed: 28,
+        bounciness: 3,
+      }).start();
+    });
+  }
+
+  function finishDrag(id) {
+    const drag = dragRef.current;
+    if (!drag.active || drag.id !== id) return;
+    drag.active = false;
+    setDraggingId(null);
+    const list = itemsRef.current.slice();
+    const from = drag.index;
+    const to = drag.hover;
+    if (from !== to && from >= 0 && to >= 0) {
+      const [moved] = list.splice(from, 1);
+      list.splice(to, 0, moved);
+    }
+    list.forEach((item, index) => {
+      const pos = positions.current[item.id];
+      if (!pos) return;
+      pos.y.setValue(index * BUY_ROW_H);
+      pos.scale.setValue(1);
+    });
+    if (from !== to) cbRef.current.onReorder?.(list);
+  }
+
+  function responderFor(id) {
+    if (responders.current[id]) return responders.current[id];
+    responders.current[id] = PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onShouldBlockNativeResponder: () => true,
+      onPanResponderGrant: () => {
+        const index = itemsRef.current.findIndex((item) => item.id === id);
+        if (index < 0) return;
+        const pos = ensure(id, index);
+        dragRef.current = { active: true, id, index, hover: index };
+        pos.y.setValue(index * BUY_ROW_H);
+        setDraggingId(id);
+        Animated.spring(pos.scale, { toValue: 1.04, useNativeDriver: true, speed: 20, bounciness: 4 }).start();
+      },
+      onPanResponderMove: (_, gesture) => {
+        const drag = dragRef.current;
+        if (!drag.active || drag.id !== id) return;
+        const pos = positions.current[id];
+        if (!pos) return;
+        const nextY = drag.index * BUY_ROW_H + gesture.dy;
+        pos.y.setValue(nextY);
+        const maxIndex = Math.max(0, itemsRef.current.length - 1);
+        const hover = Math.max(0, Math.min(maxIndex, Math.round(nextY / BUY_ROW_H)));
+        if (hover !== drag.hover) {
+          drag.hover = hover;
+          springOthers(drag.index, hover, id);
+        }
+      },
+      onPanResponderRelease: () => finishDrag(id),
+      onPanResponderTerminate: () => finishDrag(id),
+    });
+    return responders.current[id];
+  }
+
+  if (items.length === 0) return null;
+
+  return (
+    <View style={{ height: items.length * BUY_ROW_H, marginTop: 4 }}>
+      {items.map((item, index) => {
+        const pos = ensure(item.id, index);
+        const status = affordFor(item);
+        const dragging = draggingId === item.id;
+        const { borderColor, textColor } = buyCardChrome(status, dragging);
+        const price = buyPriceLabel(item);
+        return (
+          <Animated.View
+            key={item.id}
+            style={{
+              position: "absolute",
+              left: 0,
+              right: 0,
+              top: 0,
+              zIndex: dragging ? 20 : 1,
+              elevation: dragging ? 10 : 0,
+              transform: [{ translateY: pos.y }, { scale: pos.scale }],
+            }}
+          >
+            <SwipeableRow onSwipeDelete={() => onDelete(item.id)}>
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  backgroundColor: dragging ? colors.surfaceHighlight : colors.surface,
+                  borderRadius: 14,
+                  paddingVertical: 8,
+                  paddingRight: 12,
+                  paddingLeft: 4,
+                  borderWidth: 1.5,
+                  borderColor,
+                  gap: 6,
+                  shadowColor: "#000",
+                  shadowOffset: { width: 0, height: dragging ? 8 : 0 },
+                  shadowOpacity: dragging ? 0.28 : 0,
+                  shadowRadius: dragging ? 12 : 0,
+                }}
+              >
+                <View
+                  {...responderFor(item.id).panHandlers}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 6 }}
+                  style={{
+                    width: 52,
+                    minHeight: 58,
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <Text style={{ color: dragging ? colors.streakOrange : colors.textMuted, fontSize: 26, fontWeight: "900", lineHeight: 28 }}>
+                    ≡
+                  </Text>
+                </View>
+                <Pressable onLongPress={() => onEdit(item)} delayLongPress={340} style={{ flex: 1, paddingVertical: 6 }}>
+                  <Text style={{ color: textColor, fontSize: 15, fontWeight: "700" }} numberOfLines={2}>
+                    {item.title}
+                  </Text>
+                  {!!price && (
+                    <Text style={{ color: colors.textFaint, fontSize: 11, marginTop: 2, fontWeight: "600" }}>{price}</Text>
+                  )}
+                </Pressable>
+                {status !== "none" && (
+                  <Text style={{ fontSize: 16 }}>{status === "green" ? "🟢" : status === "red" ? "🔴" : "🟡"}</Text>
+                )}
+                <Pressable onPress={() => onToggle(item.id)} style={s.buyCheckbox}>
+                </Pressable>
+                <Pressable onPress={() => onDelete(item.id)} hitSlop={10}>
+                  <Text style={s.entryDeleteX}>×</Text>
+                </Pressable>
+              </View>
+            </SwipeableRow>
+          </Animated.View>
+        );
+      })}
+    </View>
+  );
+}
+
 function BuyScreen() {
   const [items, setItems] = useState([]);
-  const [newItem, setNewItem] = useState("");
-  const [newPriceMin, setNewPriceMin] = useState("");
-  const [newPriceMax, setNewPriceMax] = useState("");
   const [currentBalance, setCurrentBalance] = useState(0);
-  const [addOpen, setAddOpen] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingBuy, setEditingBuy] = useState(null);
 
   const loadData = useCallback(async () => {
-    const [data, bal] = await Promise.all([
-      listBuyItems(),
-      getTotalAccountBalance(),
-    ]);
+    const [data, bal] = await Promise.all([listBuyItems(), getTotalAccountBalance()]);
     setItems(data);
     setCurrentBalance(bal);
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
-
-  async function handleAdd() {
-    if (!newItem.trim()) return;
-    await addBuyItem(newItem.trim(), parseFloat(newPriceMin) || 0, parseFloat(newPriceMax) || 0);
-    setNewItem("");
-    setNewPriceMin("");
-    setNewPriceMax("");
-    setAddOpen(false);
-    loadData();
-  }
 
   async function handleToggle(id) {
     await toggleBuyItem(id);
@@ -3855,18 +4528,26 @@ function BuyScreen() {
     loadData();
   }
 
-  async function moveItem(index, direction) {
-    const swapIndex = index + direction;
-    if (swapIndex < 0 || swapIndex >= items.length) return;
-    await swapBuyItemsOrder(items[index], items[swapIndex]);
-    loadData();
+  function openNewItem() {
+    setEditingBuy(null);
+    setEditorOpen(true);
+  }
+
+  function openEditItem(item) {
+    setEditingBuy(item);
+    setEditorOpen(true);
+  }
+
+  async function handleReorderPending(nextPending) {
+    const done = items.filter((item) => item.completed);
+    setItems([...nextPending, ...done]);
+    await reorderBuyItems(nextPending);
   }
 
   const pendingItems = items.filter((item) => !item.completed);
   const doneItems = items.filter((item) => !!item.completed);
   const balanceColor = currentBalance >= 0 ? colors.positive : colors.negative;
 
-  // Cumulative Priority Budgeting: higher priority items consume the balance first!
   const affordMap = new Map();
   let remainingBudget = currentBalance;
   for (const item of pendingItems) {
@@ -3880,156 +4561,8 @@ function BuyScreen() {
       affordMap.set(item.id, "yellow");
       remainingBudget = Math.max(0, remainingBudget - item.price_min);
     } else {
-      // Prior items in queue used up the budget! Even if within original balance, it's red here!
       affordMap.set(item.id, "red");
     }
-  }
-
-  function GlidableBuyCard({ item, realIndex, isCompleted, onMoveItem, onToggleItem, onDeleteItem }) {
-    const translateY = useRef(new Animated.Value(0)).current;
-    const [isGliding, setIsGliding] = useState(false);
-    const lastMovedOffset = useRef(0);
-
-    const glideResponder = useRef(
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
-        onMoveShouldSetPanResponder: () => true,
-        onPanResponderGrant: () => {
-          setIsGliding(true);
-          lastMovedOffset.current = 0;
-        },
-        onPanResponderMove: (_, g) => {
-          translateY.setValue(g.dy);
-          // If dragged down past ~42px, move down in priority
-          if (g.dy - lastMovedOffset.current > 42) {
-            onMoveItem(realIndex, 1);
-            lastMovedOffset.current = g.dy;
-          }
-          // If dragged up past -42px, move up in priority
-          else if (g.dy - lastMovedOffset.current < -42) {
-            onMoveItem(realIndex, -1);
-            lastMovedOffset.current = g.dy;
-          }
-        },
-        onPanResponderRelease: () => {
-          setIsGliding(false);
-          Animated.spring(translateY, { toValue: 0, useNativeDriver: true, bounciness: 4 }).start();
-        },
-        onPanResponderTerminate: () => {
-          setIsGliding(false);
-          Animated.spring(translateY, { toValue: 0, useNativeDriver: true }).start();
-        },
-      })
-    ).current;
-
-    const status = isCompleted ? "none" : (affordMap.get(item.id) || "none");
-    const borderColor = status === "green" ? "#22C55E50" : status === "red" ? "#EF444450" : status === "yellow" ? "#FBBF2450" : colors.border;
-    const textColor = status === "green" ? "#22C55E" : status === "red" ? "#EF4444" : status === "yellow" ? "#FBBF24" : colors.text;
-
-    return (
-      <Animated.View
-        style={{
-          transform: [{ translateY }, { scale: isGliding ? 1.02 : 1 }],
-          zIndex: isGliding ? 999 : 1,
-          marginBottom: 8,
-        }}
-      >
-        <SwipeableRow onSwipeDelete={() => onDeleteItem(item.id)}>
-          <View
-            style={{
-              flexDirection: "row",
-              alignItems: "center",
-              backgroundColor: isGliding ? colors.surfaceHighlight : colors.surface,
-              borderRadius: 14,
-              paddingVertical: 10,
-              paddingHorizontal: 12,
-              borderWidth: 1.5,
-              borderColor: isGliding ? colors.streakOrange : borderColor,
-              gap: 8,
-              elevation: isGliding ? 8 : 0,
-              shadowColor: "#000",
-              shadowOffset: { width: 0, height: isGliding ? 6 : 0 },
-              shadowOpacity: isGliding ? 0.35 : 0,
-              shadowRadius: isGliding ? 10 : 0,
-            }}
-          >
-            {/* Spotify-style Glide Handle */}
-            {!isCompleted && (
-              <View
-                {...glideResponder.panHandlers}
-                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                style={{
-                  paddingVertical: 8,
-                  paddingHorizontal: 6,
-                  justifyContent: "center",
-                  alignItems: "center",
-                }}
-              >
-                <Text
-                  style={{
-                    color: isGliding ? colors.streakOrange : colors.textMuted,
-                    fontSize: 22,
-                    fontWeight: "900",
-                    lineHeight: 22,
-                    letterSpacing: -1,
-                  }}
-                >
-                  ≡
-                </Text>
-              </View>
-            )}
-
-            {/* Item Info */}
-            <View style={{ flex: 1 }}>
-              <Text
-                style={{
-                  color: isCompleted ? colors.textFaint : textColor,
-                  fontSize: 14,
-                  fontWeight: "700",
-                  textDecorationLine: isCompleted ? "line-through" : "none",
-                }}
-              >
-                {item.title}
-              </Text>
-              {(item.price_min > 0 || item.price_max > 0) && (
-                <Text style={{ color: colors.textFaint, fontSize: 11, marginTop: 2, fontWeight: "600" }}>
-                  {item.price_min > 0 && item.price_max > 0
-                    ? `₹${item.price_min} – ₹${item.price_max}`
-                    : item.price_max > 0
-                    ? `Up to ₹${item.price_max}`
-                    : `From ₹${item.price_min}`}
-                </Text>
-              )}
-            </View>
-
-            {/* Affordability Badge Indicator */}
-            {status !== "none" && (
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 3 }}>
-                <Text style={{ fontSize: 14 }}>
-                  {status === "green" ? "🟢" : status === "red" ? "🔴" : "🟡"}
-                </Text>
-                {status === "red" && (
-                  <Text style={{ color: colors.negative, fontSize: 10, fontWeight: "700" }}>Out of budget</Text>
-                )}
-              </View>
-            )}
-
-            {/* Checkbox */}
-            <Pressable
-              onPress={() => onToggleItem(item.id)}
-              style={[s.buyCheckbox, isCompleted && s.buyCheckboxCompleted]}
-            >
-              {isCompleted && <Text style={s.buyCheckmark}>✓</Text>}
-            </Pressable>
-
-            {/* Delete button */}
-            <Pressable onPress={() => onDeleteItem(item.id)} hitSlop={10}>
-              <Text style={s.entryDeleteX}>×</Text>
-            </Pressable>
-          </View>
-        </SwipeableRow>
-      </Animated.View>
-    );
   }
 
   return (
@@ -4040,7 +4573,6 @@ function BuyScreen() {
         contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: BOTTOM_INSET + 100 + TAB_BAR_HEIGHT }}
         keyboardShouldPersistTaps="handled"
       >
-        {/* HERO BANNER FOR BUY LIST */}
         <View style={s.bannerCard}>
           <EditableImage
             imageKey="banner_buy"
@@ -4054,7 +4586,6 @@ function BuyScreen() {
           </View>
         </View>
 
-        {/* Balance card */}
         <View style={[s.summaryCard, cardShadow, { marginTop: 16, marginBottom: 4 }]}>
           <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
             <View>
@@ -4071,35 +4602,28 @@ function BuyScreen() {
           </View>
         </View>
 
-        {/* Pending items */}
         {pendingItems.length > 0 && (
-          <Text style={[s.listLabel, { marginTop: 14 }]}>Priority Queue 📋 · glide ≡ to reorder</Text>
+          <Text style={[s.listLabel, { marginTop: 14 }]}>Priority Queue · drag ≡ to reorder · long-press to edit</Text>
         )}
-        {pendingItems.map((item, idx) => (
-          <GlidableBuyCard
-            key={item.id}
-            item={item}
-            realIndex={items.indexOf(item)}
-            isCompleted={false}
-            onMoveItem={moveItem}
-            onToggleItem={handleToggle}
-            onDeleteItem={handleDelete}
-          />
-        ))}
+        <BuyPriorityList
+          items={pendingItems}
+          affordFor={(item) => affordMap.get(item.id) || "none"}
+          onToggle={handleToggle}
+          onDelete={handleDelete}
+          onEdit={openEditItem}
+          onReorder={handleReorderPending}
+        />
 
-        {/* Done items */}
         {doneItems.length > 0 && (
           <>
-            <Text style={[s.listLabel, { marginTop: 14 }]}>Done ✅</Text>
-            {doneItems.map((item, idx) => (
-              <GlidableBuyCard
+            <Text style={[s.listLabel, { marginTop: 14 }]}>Done ✅ · long-press to edit</Text>
+            {doneItems.map((item) => (
+              <BuyDoneCard
                 key={item.id}
                 item={item}
-                realIndex={items.indexOf(item)}
-                isCompleted={true}
-                onMoveItem={moveItem}
-                onToggleItem={handleToggle}
-                onDeleteItem={handleDelete}
+                onToggle={handleToggle}
+                onDelete={handleDelete}
+                onEdit={openEditItem}
               />
             ))}
           </>
@@ -4111,69 +4635,25 @@ function BuyScreen() {
             <Text style={s.emptyText}>No items in your buy list yet! 🛒{"\n"}Tap + to add your first item.</Text>
           </View>
         )}
-
-        {/* Add form */}
-        {addOpen && (
-          <View style={[s.summaryCard, cardShadow, { marginTop: 16 }]}>
-            <Text style={[s.label, { marginTop: 0 }]}>Item name</Text>
-            <TextInput
-              value={newItem}
-              onChangeText={setNewItem}
-              placeholder="e.g. AirPods, Running Shoes..."
-              placeholderTextColor={colors.textFaint}
-              style={s.input}
-              autoFocus
-              onSubmitEditing={handleAdd}
-            />
-            <Text style={s.label}>Price range (₹)</Text>
-            <View style={{ flexDirection: "row", gap: 8 }}>
-              <TextInput
-                value={newPriceMin}
-                onChangeText={setNewPriceMin}
-                placeholder="Min ₹"
-                placeholderTextColor={colors.textFaint}
-                keyboardType="numeric"
-                style={[s.input, { flex: 1 }]}
-              />
-              <TextInput
-                value={newPriceMax}
-                onChangeText={setNewPriceMax}
-                placeholder="Max ₹"
-                placeholderTextColor={colors.textFaint}
-                keyboardType="numeric"
-                style={[s.input, { flex: 1 }]}
-              />
-            </View>
-            <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
-              <Pressable
-                onPress={() => setAddOpen(false)}
-                style={[s.saveBtn, { flex: 1, backgroundColor: colors.surfaceRaised, borderWidth: 1, borderColor: colors.border }]}
-              >
-                <Text style={{ color: colors.textMuted, fontWeight: "700" }}>Cancel</Text>
-              </Pressable>
-              <Pressable
-                onPress={handleAdd}
-                style={[s.saveBtn, { flex: 2, backgroundColor: "#4ADE80" }]}
-              >
-                <Text style={s.saveBtnText}>Add to List ✅</Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
       </ScrollView>
 
-      {/* FAB */}
-      {!addOpen && (
-        <Pressable
-          style={[s.fab, cardShadow, { backgroundColor: "#4ADE80", bottom: BOTTOM_INSET + 20 + TAB_BAR_HEIGHT }]}
-          onPress={() => setAddOpen(true)}
-        >
-          <Text style={s.fabText}>+</Text>
-        </Pressable>
-      )}
+      <Pressable
+        style={[s.fab, cardShadow, { backgroundColor: "#4ADE80", bottom: BOTTOM_INSET + 20 + TAB_BAR_HEIGHT }]}
+        onPress={openNewItem}
+      >
+        <Text style={s.fabText}>+</Text>
+      </Pressable>
+
+      <BuyItemModal
+        visible={editorOpen}
+        item={editingBuy}
+        onClose={() => setEditorOpen(false)}
+        onSaved={loadData}
+      />
     </View>
   );
 }
+
 
 // ───────────── PRESET AVATARS ─────────────
 const PRESET_AVATARS = [
@@ -6675,26 +7155,26 @@ function createAppStyles(colors) {
     backgroundColor: colors.surface,
     borderTopWidth: 1,
     borderTopColor: colors.border,
-    paddingBottom: Platform.OS === "ios" ? 12 : 4,
-    paddingTop: 4,
+    paddingBottom: Platform.OS === "ios" ? 18 : 8,
+    paddingTop: 8,
     ...cardShadow,
   },
   bottomTabItem: {
-    minWidth: 72,
+    minWidth: 92,
     alignItems: "center",
     justifyContent: "center",
-    gap: 2,
+    gap: 4,
     position: "relative",
-    paddingHorizontal: 8,
-    paddingVertical: 2,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
   },
   bottomTabIcon: {
-    width: 22,
-    height: 22,
+    width: 36,
+    height: 36,
     resizeMode: "contain",
   },
   bottomTabLabel: {
-    fontSize: 9,
+    fontSize: 13,
     letterSpacing: 0.2,
   },
   bottomTabActiveDot: {
